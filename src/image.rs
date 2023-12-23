@@ -2,7 +2,13 @@ use image::imageops::Gaussian;
 use image::{Rgb, RgbImage};
 use imageproc::definitions::HasBlack;
 use imageproc::drawing::draw_text_mut;
+use rust_embed::RustEmbed;
 use rusttype::{Font, Scale};
+
+#[derive(RustEmbed)]
+#[folder = "res"]
+#[include = "*.ttf"]
+struct Asset;
 
 /// https://github.com/yihong0618/blue
 /// https://github.com/andelf/text-image
@@ -17,8 +23,9 @@ pub fn generate_image(src: Option<&str>, text: Option<&str>) -> Result<RgbImage,
         let mut text = format!("{}\n{}\n", "-".repeat(27), text);
         text.push_str(&" ".repeat(27 * 5));
         let font_size = 24.0;
-        let font_raw = std::fs::read("res/zpix.ttf").expect("Can not read font file");
-        let font = Font::try_from_vec(font_raw).unwrap();
+        let file = Asset::get("zpix.ttf").unwrap();
+        // let font_raw = std::fs::read(file).expect("Can not read font file");
+        let font = Font::try_from_bytes(&file.data).unwrap();
         let scale = Scale {
             x: font_size,
             y: font_size,
