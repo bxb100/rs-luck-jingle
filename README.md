@@ -3,3 +3,5 @@
 # 参考
 
 - https://github.com/Lakr233/GGLyn
+- https://github.com/yihong0618/blue
+- https://github.com/andelf/text-image
