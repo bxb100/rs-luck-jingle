@@ -85,16 +85,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
 
         printer
-            .write(
-                cmd_char,
-                SET_THICKNESS.as_slice(),
-                WriteType::WithResponse,
-            )
+            .write(cmd_char, SET_THICKNESS.as_slice(), WriteType::WithResponse)
             .await?;
 
-        // let buffer = generate_image(None, Some("你有新的报道")).unwrap();
+        let buffer = generate_image(None, Some("你有新的报道")).unwrap();
         // let buffer = generate_image(Some("./res/img.png"), None).unwrap();
-        let buffer = generate_image(None, Some("哇哈哈哈哈哈哈哈哈哈哈哈哈哈啊哈哈哈哈 Molestiae et voluptatem quos maxime eius reiciendis. Ullam deleniti aspernatur deleniti qui dolorem minus voluptatum non beatae. Consequatur quia eos quidem magni dolorem velit et dolores eum a enim. Libero et rerum voluptatem placeat vitae similique nemo aut id dolores. Dolorum consequatur doloribus perspiciatis. Et omnis eius quam deserunt dicta laborum repudiandae. Voluptates quam et occaecati et dolorum temporibus. rem Officia Impedit Eum Voluptas Ut Similique")).unwrap();
+        // let buffer = generate_image(None, Some("哇哈哈哈哈哈哈哈哈哈哈哈哈哈啊哈哈哈哈 Molestiae et voluptatem quos maxime eius reiciendis. Ullam deleniti aspernatur deleniti qui dolorem minus voluptatum non beatae. Consequatur quia eos quidem magni dolorem velit et dolores eum a enim. Libero et rerum voluptatem placeat vitae similique nemo aut id dolores. Dolorum consequatur doloribus perspiciatis. Et omnis eius quam deserunt dicta laborum repudiandae. Voluptates quam et occaecati et dolorum temporibus. rem Officia Impedit Eum Voluptas Ut Similique")).unwrap();
 
         let mut dither_apply = DitherApply::new(buffer);
         let image_hex_str = dither_apply.make_image_hex_str();

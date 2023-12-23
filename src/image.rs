@@ -1,5 +1,5 @@
 use image::imageops::{dither, BiLevel, Gaussian};
-use image::{GrayImage, Luma, Rgb, RgbImage};
+use image::{GrayImage, Luma};
 use imageproc::definitions::HasBlack;
 use imageproc::drawing::draw_text_mut;
 use rusttype::{Font, Scale};
@@ -10,7 +10,11 @@ pub fn generate_image(src: Option<&str>, text: Option<&str>) -> Result<GrayImage
     if let Some(src) = src {
         return image::open(src)
             .map(|img| img.resize(384, img.height(), Gaussian))
-            .map(|img| img.grayscale().to_luma8())
+            .map(|img| {
+                let mut buff = img.to_luma8();
+                dither(&mut buff, &BiLevel);
+                buff
+            })
             .map_err(|e| e.to_string());
     } else if let Some(text) = text {
         // add --- in front and behind
@@ -72,6 +76,7 @@ pub fn generate_image(src: Option<&str>, text: Option<&str>) -> Result<GrayImage
                 line,
             );
         }
+        dither(&mut image, &BiLevel);
         return Ok(image);
     }
 
