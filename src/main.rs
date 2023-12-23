@@ -2,6 +2,7 @@
 
 use actix_web::http::header::Charset::Iso_8859_1;
 use actix_web::http::header::HeaderValue;
+use actix_web::rt::time;
 use actix_web::web::Data;
 use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use std::error::Error;
@@ -18,12 +19,10 @@ use btleplug::api::{
     WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
-pub use futures::stream::StreamExt;
 use image::{DynamicImage, GrayImage, Luma};
 use imageproc::drawing::{draw_text_mut, text_size};
 use rusttype::{Font, Scale};
 use serde::Deserialize;
-use tokio::time;
 use uuid::Uuid;
 
 use anyhow::Result;
@@ -183,7 +182,9 @@ async fn main() -> std::io::Result<()> {
         panic!("->>> BLE peripheral devices were not found, sorry. Exiting...");
     }
 
-    let printer = find_printer(peripherals).await.unwrap();
+    let printer = find_printer(peripherals)
+        .await
+        .expect("printer not start or it is linking other device");
     println!("{:?}", printer);
 
     // connect to the device
@@ -215,6 +216,11 @@ async fn main() -> std::io::Result<()> {
             DISABLE_SHUTDOWN.as_slice(),
             WriteType::WithResponse,
         )
+        .await
+        .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e))?;
+
+    printer
+        .write(&cmd_char, SET_THICKNESS.as_slice(), WriteType::WithResponse)
         .await
         .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e))?;
 
@@ -265,15 +271,17 @@ async fn github_webhooks(
         }
         let issue = hook.0.issue.unwrap();
         format!(
-            "{}\n\
-            REPO: {}\n\
-            新的 ISSUE 来了来了来了！\n\
-            ISSUE Title: {}\n\
-            Content:\n {}",
+            "{}\nREPO: {}\n新的 ISSUE 来了来了来了！\n\
+            ISSUE Title: {}\nContent:\n {}",
             now,
             hook.0.repository.full_name,
             issue.title,
-            LINK_REGEX.replace_all(&issue.body.unwrap_or("".to_string()), "<链接或图片暂时无法显示>")
+            truncate(
+                LINK_REGEX
+                    .replace_all(issue.body.unwrap_or("".to_string()).trim(), "")
+                    .as_ref(),
+                60
+            )
         )
     } else if (github_event == "issue_comment") {
         if (hook.0.action.unwrap() != "created") {
@@ -281,14 +289,19 @@ async fn github_webhooks(
         }
 
         format!(
-            "{}\nREPO: {}\nISSUE: {}\n{} 评论了这个 ISSUE",
+            "{}\nREPO: {}\nISSUE: {}\n{} 刚刚留下了评论",
             now,
             hook.0.repository.full_name,
             hook.0.issue.unwrap().title,
             hook.0.comment.unwrap().user.unwrap().login
         )
     } else if (github_event == "ping") {
-        format!("{}\nREPO: {}\nPING PONG", now, hook.0.repository.full_name)
+        format!(
+            "{}\nREPO: {}\n{}\n ---- SETUP DONE --- ",
+            now,
+            hook.0.repository.full_name,
+            hook.0.zen.unwrap()
+        )
     } else {
         log::error!("Unhandled event: {:?}", github_event);
         return HttpResponse::BadRequest().finish();
@@ -301,8 +314,16 @@ async fn github_webhooks(
     HttpResponse::Ok().finish()
 }
 
+fn truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        None => s,
+        Some((idx, _)) => &s[..idx],
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubWebhook {
+    zen: Option<String>,
     action: Option<String>,
     issue: Option<Issue>,
     comment: Option<Comment>,
@@ -329,6 +350,7 @@ struct Issue {
     body: Option<String>,
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn call_printer(
     text: &str,
     printer: &Mutex<Peripheral>,
@@ -382,7 +404,14 @@ async fn call_printer(
         }
     }
 
-    time::sleep(Duration::from_secs(2)).await;
+    printer
+        .write(
+            cmd_char,
+            STOP_PRINT_JOBS.as_slice(),
+            WriteType::WithResponse,
+        )
+        .await?;
+
     Ok(())
 }
 
