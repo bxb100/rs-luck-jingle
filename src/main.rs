@@ -11,9 +11,6 @@ use std::num::ParseIntError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ble_example::dither::DitherApply;
-use ble_example::hex::decode_hex;
-use ble_example::image::generate_image;
 use btleplug::api::{
     Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, ValueNotification,
     WriteType,
@@ -21,15 +18,18 @@ use btleplug::api::{
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use image::{DynamicImage, GrayImage, Luma};
 use imageproc::drawing::{draw_text_mut, text_size};
+use rs_luck_jingle::dither::DitherApply;
+use rs_luck_jingle::hex::decode_hex;
+use rs_luck_jingle::image::generate_image;
 use rusttype::{Font, Scale};
 use serde::Deserialize;
 use uuid::Uuid;
 
 use anyhow::Result;
-use ble_example::instruction::*;
 use chrono::Utc;
 use lazy_static::lazy_static;
 use regex::Regex;
+use rs_luck_jingle::instruction::*;
 
 async fn get_central(manager: &Manager) -> Adapter {
     let adapters = manager.adapters().await.unwrap();
@@ -159,7 +159,7 @@ async fn github_webhooks(
                 LINK_REGEX
                     .replace_all(issue.body.unwrap_or("".to_string()).trim(), "")
                     .as_ref(),
-                60
+                60,
             )
         )
     } else if (github_event == "issue_comment") {
@@ -208,10 +208,12 @@ struct GithubWebhook {
     comment: Option<Comment>,
     repository: Repository,
 }
+
 #[derive(Debug, Deserialize)]
 struct Repository {
     full_name: String,
 }
+
 #[derive(Debug, Deserialize)]
 struct Comment {
     body: String,

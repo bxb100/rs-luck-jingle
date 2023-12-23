@@ -89,13 +89,13 @@ pub fn generate_image(src: Option<&str>, text: Option<&str>) -> Result<RgbImage,
 #[test]
 fn test_generate_text_image() {
     let text = "2023-12-23 17:48:33\n\
-    REPO: bxb100/ble-example\n\
+    REPO: bxb100/rs-luck-jingle\n\
     新的 ISSUE 来了来了来了！\n\
     ISSUE Title: CS2\n\
     Content:\n\
      带图片\n\
     ![fox](https://github.com/bx\n\
-    b100/ble-example/assets/2068\n\
+    b100/rs-luck-jingle/assets/2068\n\
     5961/9c98eba0-37aa-4844-bbd4\n\
     -621a5bc278f4)\n";
 
