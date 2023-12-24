@@ -2,14 +2,15 @@ use crate::dither::DitherApply;
 use crate::hex::decode_hex;
 use crate::image::generate_image;
 use crate::instruction::{
-    DISABLE_SHUTDOWN, PRINTER_NAME_PREFIX, SET_THICKNESS, STOP_PRINT_JOBS, WRITE_UUID,
+    DISABLE_SHUTDOWN, ENABLE_PRINTER, PRINTER_NAME_PREFIX, PRINTER_WAKE_MAGIC, PRINT_LINE_DOTS,
+    SET_THICKNESS, STOP_PRINT_JOBS, WRITE_UUID,
 };
 use actix_web::rt::time;
+use anyhow::anyhow;
 use btleplug::api::{
     Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
-use std::io::ErrorKind;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -26,25 +27,20 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
     let central = get_central(&manager).await;
 
     // start scanning for devices
-    central
-        .start_scan(ScanFilter::default())
-        .await
-        .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e))?;
+    central.start_scan(ScanFilter::default()).await?;
     // instead of waiting, you can use central.events() to get a stream which will
     // notify you of new devices, for an example of that see examples/event_driven_discovery.rs
     time::sleep(Duration::from_secs(2)).await;
 
-    let peripherals = central
-        .peripherals()
-        .await
-        .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e))?;
+    let peripherals = central.peripherals().await?;
+
     if peripherals.is_empty() {
-        panic!("->>> BLE peripheral devices were not found, sorry. Exiting...");
+        return Err(anyhow!(
+            "BLE peripheral devices were not found, sorry. Exiting..."
+        ));
     }
 
-    let printer = find_printer(peripherals)
-        .await
-        .expect("printer not start or it is linking other device");
+    let printer = find_printer(peripherals).await?;
 
     log::debug!("{:?}", printer);
 
@@ -61,9 +57,9 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
         chars
             .iter()
             .find(|c| c.uuid == uuid)
-            .expect("unable to find characteristics")
+            .ok_or(anyhow!("characteristic {:?} not found", uuid))
     };
-    let cmd_char = find_char(WRITE_UUID);
+    let cmd_char = find_char(WRITE_UUID)?;
 
     printer
         .write(
@@ -71,10 +67,6 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
             DISABLE_SHUTDOWN.as_slice(),
             WriteType::WithResponse,
         )
-        .await?;
-
-    printer
-        .write(cmd_char, SET_THICKNESS.as_slice(), WriteType::WithResponse)
         .await?;
 
     Ok((printer, cmd_char.clone()))
@@ -86,6 +78,21 @@ pub async fn call_printer(
     printer: &Peripheral,
     cmd_char: &Characteristic,
 ) -> anyhow::Result<()> {
+    printer
+        .write(cmd_char, ENABLE_PRINTER.as_slice(), WriteType::WithResponse)
+        .await?;
+    printer
+        .write(cmd_char, SET_THICKNESS.as_slice(), WriteType::WithResponse)
+        .await?;
+
+    printer
+        .write(
+            cmd_char,
+            PRINTER_WAKE_MAGIC.as_slice(),
+            WriteType::WithResponse,
+        )
+        .await?;
+
     let buffer = generate_image(None, Some(text)).unwrap();
 
     let mut dither_apply = DitherApply::new(buffer);
@@ -141,7 +148,7 @@ pub async fn call_printer(
     Ok(())
 }
 
-async fn find_printer(peripherals: Vec<Peripheral>) -> Option<Peripheral> {
+async fn find_printer(peripherals: Vec<Peripheral>) -> anyhow::Result<Peripheral> {
     for p in peripherals {
         if p.properties()
             .await
@@ -151,8 +158,9 @@ async fn find_printer(peripherals: Vec<Peripheral>) -> Option<Peripheral> {
             .iter()
             .any(|name| name.contains(PRINTER_NAME_PREFIX))
         {
-            return Some(p);
+            return Ok(p);
         }
     }
-    None
+
+    Err(anyhow!("printer not found"))
 }

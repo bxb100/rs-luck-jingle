@@ -19,7 +19,7 @@ lazy_static! {
     pub static ref DISABLE_SHUTDOWN: Vec<u8> = "10 FF 12 00 00".to_hex();
     pub static ref ENABLE_PRINTER: Vec<u8> = "10 FF F1 03".to_hex();
     // 00 - 1, 01 - 2, 02 - 3
-    pub static ref SET_THICKNESS: Vec<u8> = "10 FF 10 00 02".to_hex();
+    pub static ref SET_THICKNESS: Vec<u8> = "10 FF 10 00 01".to_hex();
     pub static ref PRINT_LINE_DOTS: Vec<u8> = "1B 4A 40".to_hex();
     pub static ref STOP_PRINT_JOBS: Vec<u8> = "10 FF F1 45".to_hex();
     pub static ref IMAGE_COMMAND_HEADER: Vec<u8> = "1D 76 30".to_hex();

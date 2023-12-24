@@ -16,9 +16,13 @@ async fn main() -> std::io::Result<()> {
     let shared_sender = Data::new(tx);
 
     tokio::spawn(async move {
-        let (printer, cmd) = init_printer().await.unwrap();
-        while let Some(s) = rx.recv().await {
-            let _ = call_printer(s.as_str(), &printer, &cmd).await;
+        if let Ok((printer, cmd)) = init_printer().await {
+            while let Some(s) = rx.recv().await {
+                let _ = call_printer(s.as_str(), &printer, &cmd).await;
+            }
+        } else {
+            log::error!("init printer failed");
+            std::process::exit(1);
         }
     });
 
