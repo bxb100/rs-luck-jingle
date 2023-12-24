@@ -2,8 +2,8 @@ use crate::dither::DitherApply;
 use crate::hex::decode_hex;
 use crate::image::generate_image;
 use crate::instruction::{
-    DISABLE_SHUTDOWN, ENABLE_PRINTER, PRINTER_NAME_PREFIX, PRINTER_WAKE_MAGIC, PRINT_LINE_DOTS,
-    SET_THICKNESS, STOP_PRINT_JOBS, WRITE_UUID,
+    DISABLE_SHUTDOWN, ENABLE_PRINTER, PRINTER_NAME_PREFIX, PRINTER_WAKE_MAGIC, SET_THICKNESS,
+    STOP_PRINT_JOBS, WRITE_UUID,
 };
 use actix_web::rt::time;
 use anyhow::anyhow;
