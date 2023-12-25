@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 //  printer name
 pub const PRINTER_NAME_PREFIX: &str = "LuckP_D1";
-pub const PRINTER_WIDTH: u32 = 384;
 
 // characters
 pub const READ_UUID_1: Uuid = uuid_from_u16(0xFF01);
@@ -17,9 +16,10 @@ pub const WRITE_UUID: Uuid = uuid_from_u16(0xFF02);
 lazy_static! {
     pub static ref CHECK_MAC_ADDRESS: Vec<u8> = "10 FF 30 12".to_hex();
     pub static ref DISABLE_SHUTDOWN: Vec<u8> = "10 FF 12 00 00".to_hex();
+    pub static ref ENABLE_PRINTER_0: Vec<u8> = "10FF40".to_hex();
     pub static ref ENABLE_PRINTER: Vec<u8> = "10 FF F1 03".to_hex();
-    // 00 - 1, 01 - 2, 02 - 3
-    pub static ref SET_THICKNESS: Vec<u8> = "10 FF 10 00 01".to_hex();
+    // set density (0000 for low, 0100 for normal, 0200 for high)
+    pub static ref SET_THICKNESS: Vec<u8> = format!("{:0<156}", "10FF10000200").to_hex();
     pub static ref PRINT_LINE_DOTS: Vec<u8> = "1B 4A 40".to_hex();
     pub static ref STOP_PRINT_JOBS: Vec<u8> = "10 FF F1 45".to_hex();
     pub static ref IMAGE_COMMAND_HEADER: Vec<u8> = "1D 76 30".to_hex();

@@ -1,10 +1,7 @@
 use crate::dither::DitherApply;
 use crate::hex::decode_hex;
 use crate::image::generate_image;
-use crate::instruction::{
-    DISABLE_SHUTDOWN, ENABLE_PRINTER, PRINTER_NAME_PREFIX, PRINTER_WAKE_MAGIC, SET_THICKNESS,
-    STOP_PRINT_JOBS, WRITE_UUID,
-};
+use crate::instruction::*;
 use actix_web::rt::time;
 use anyhow::anyhow;
 use btleplug::api::{
@@ -73,7 +70,31 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
     printer
         .write(
             cmd_char,
+            ENABLE_PRINTER_0.as_slice(),
+            WriteType::WithResponse,
+        )
+        .await?;
+
+    printer
+        .write(
+            cmd_char,
+            ENABLE_PRINTER.as_slice(),
+            WriteType::WithResponse,
+        )
+        .await?;
+
+    printer
+        .write(
+            cmd_char,
             DISABLE_SHUTDOWN.as_slice(),
+            WriteType::WithResponse,
+        )
+        .await?;
+
+    printer
+        .write(
+            cmd_char,
+            SET_THICKNESS.as_slice(),
             WriteType::WithResponse,
         )
         .await?;
@@ -107,13 +128,6 @@ async fn _call_printer(
             log::debug!("connected to printer");
         }
     }
-
-    printer
-        .write(cmd_char, ENABLE_PRINTER.as_slice(), WriteType::WithResponse)
-        .await?;
-    printer
-        .write(cmd_char, SET_THICKNESS.as_slice(), WriteType::WithResponse)
-        .await?;
 
     printer
         .write(
@@ -198,7 +212,12 @@ async fn find_printer(peripherals: Vec<Peripheral>) -> anyhow::Result<Peripheral
 #[tokio::test]
 async fn test_printer() {
     let (printer, cmd) = init_printer().await.unwrap();
-    _call_printer(Some("./res/fox.png"), None, &printer, &cmd)
-        .await
-        .unwrap();
+    _call_printer(
+        Some("./res/test_concat.png"),
+        None,
+        &printer,
+        &cmd,
+    )
+    .await
+    .unwrap();
 }
