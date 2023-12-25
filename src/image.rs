@@ -99,7 +99,9 @@ fn test_generate_text_image() {
     5961/9c98eba0-37aa-4844-bbd4\n\
     -621a5bc278f4)\n";
 
-    let image_buffer = generate_image(None, Some(text)).unwrap();
+    let mut image_buffer = generate_image(None, Some(text)).unwrap();
+
+    image::imageops::dither(&mut image_buffer, &crate::dither::BiLevel2);
 
     image_buffer
         .save("./res/test_generate_text_image.png")
@@ -107,7 +109,9 @@ fn test_generate_text_image() {
 }
 #[test]
 fn test_image() {
-    let image_buffer = generate_image(Some("./res/fox.png"), None).unwrap();
+    let mut image_buffer = generate_image(Some("./res/fox.png"), None).unwrap();
+
+    image::imageops::dither(&mut image_buffer, &crate::dither::BiLevel2);
 
     image_buffer.save("./res/test_image.png").unwrap();
 }

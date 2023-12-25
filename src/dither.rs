@@ -5,7 +5,7 @@ pub struct DitherApply {
     size: (u32, u32),
     buff: RgbImage,
 }
-struct BiLevel2;
+pub struct BiLevel2;
 
 const CONTRAST: f64 = 1.45 * 1.45;
 const BRIGHTNESS: f64 = 0.35;

@@ -81,9 +81,18 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
     Ok((printer, cmd_char.clone()))
 }
 
-#[allow(clippy::await_holding_lock)]
 pub async fn call_printer(
     text: &str,
+    printer: &Peripheral,
+    cmd_char: &Characteristic,
+) -> anyhow::Result<()> {
+    _call_printer(None, Some(text), printer, cmd_char).await
+}
+
+#[allow(clippy::await_holding_lock)]
+async fn _call_printer(
+    img: Option<&str>,
+    text: Option<&str>,
     printer: &Peripheral,
     cmd_char: &Characteristic,
 ) -> anyhow::Result<()> {
@@ -114,7 +123,7 @@ pub async fn call_printer(
         )
         .await?;
 
-    let buffer = generate_image(None, Some(text)).unwrap();
+    let buffer = generate_image(img, text).unwrap();
 
     let mut dither_apply = DitherApply::new(buffer);
     let image_hex_str = dither_apply.make_image_hex_str();
@@ -184,4 +193,12 @@ async fn find_printer(peripherals: Vec<Peripheral>) -> anyhow::Result<Peripheral
     }
 
     Err(anyhow!("printer not found"))
+}
+
+#[tokio::test]
+async fn test_printer() {
+    let (printer, cmd) = init_printer().await.unwrap();
+    _call_printer(Some("./res/fox.png"), None, &printer, &cmd)
+        .await
+        .unwrap();
 }
