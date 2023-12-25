@@ -10,9 +10,6 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
-RUN apt-get update -y \
-        && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
-
 # Copy the build plan from the previous Docker stage
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies - this layer is cached as long as `recipe.json`
