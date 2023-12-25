@@ -26,9 +26,9 @@ WORKDIR /app
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
     gcc \
+    bluez \
     libc6-dev \
-#    libdbus-1-dev \
-#    pkg-config \
+    libdbus-1-dev \
     # Clean up
     && apt-get autoremove -y \
     && apt-get clean -y \
