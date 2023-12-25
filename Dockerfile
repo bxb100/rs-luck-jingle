@@ -29,6 +29,7 @@ RUN apt-get update -y \
     bluez \
     libc6-dev \
     libdbus-1-dev \
+    rfkill \
     # Clean up
     && apt-get autoremove -y \
     && apt-get clean -y \
