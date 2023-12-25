@@ -30,8 +30,8 @@ RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
     gcc \
     libc6-dev \
-    libdbus-1-dev \
-    pkg-config \
+#    libdbus-1-dev \
+#    pkg-config \
     # Clean up
     && apt-get autoremove -y \
     && apt-get clean -y \

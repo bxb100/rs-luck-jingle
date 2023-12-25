@@ -59,7 +59,7 @@ async fn main() -> std::io::Result<()> {
             .service(index)
             .service(github_webhooks)
     })
-    .bind(("127.0.0.1", 5444))?
+    .bind(("0.0.0.0", 5444))?
     .run()
     .await
 }
