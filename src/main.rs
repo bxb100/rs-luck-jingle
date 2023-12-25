@@ -8,21 +8,46 @@ use regex::Regex;
 use rs_luck_jingle::printer::{call_printer, init_printer};
 use serde::Deserialize;
 use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::{oneshot, Semaphore};
+
+type Message = (String, oneshot::Sender<bool>);
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let (tx, mut rx) = channel::<String>(100);
+    let (tx, mut rx) = channel::<Message>(100);
 
     let shared_sender = Data::new(tx);
 
     tokio::spawn(async move {
-        if let Ok((printer, cmd)) = init_printer().await {
-            while let Some(s) = rx.recv().await {
-                let _ = call_printer(s.as_str(), &printer, &cmd).await;
+        let mut context = init_printer().await.ok();
+        let mut status = context.is_some();
+        let semaphore = Semaphore::new(1);
+
+        while let Some((s, tx)) = rx.recv().await {
+            // HINT: remember there is SINGER consumer, don't make it too slow, it'll block the next message
+            log::debug!("recv: {:?}", s);
+
+            if status {
+                let _ = tx.send(true);
+                let (printer, cmd) = context.as_ref().unwrap();
+                if call_printer(s.as_str(), printer, cmd).await.is_err() {
+                    // edge case: printer lose power
+                    // but we don't know until this flag set to false
+                    // so it maybe false return OK(200) to github
+                    // we retry at next webhooks call
+                    status = false;
+                }
+            } else {
+                let _ = tx.send(false);
+                log::error!("init printer failed, retrying...");
+                status = false;
+                // retry init printer and minimize the retry frequency
+                if semaphore.try_acquire().is_ok() {
+                    context = init_printer().await.ok();
+                    log::debug!("init printer: {:?}", context);
+                    status = context.is_some();
+                }
             }
-        } else {
-            log::error!("init printer failed");
-            std::process::exit(1);
         }
     });
 
@@ -50,7 +75,7 @@ lazy_static! {
 }
 #[post("/github-webhooks")]
 async fn github_webhooks(
-    sender: Data<Sender<String>>,
+    sender: Data<Sender<Message>>,
     hook: web::Json<GithubWebhook>,
     req: HttpRequest,
 ) -> impl Responder {
@@ -105,8 +130,14 @@ async fn github_webhooks(
         return HttpResponse::BadRequest().finish();
     };
 
-    if let Err(e) = sender.send(str).await {
+    let (tx, rx) = oneshot::channel::<bool>();
+
+    if let Err(e) = sender.send((str, tx)).await {
         log::error!("channel sender error: {:?}", e)
+    }
+
+    if !rx.await.unwrap_or(false) {
+        return HttpResponse::InternalServerError().finish();
     }
 
     HttpResponse::Ok().finish()

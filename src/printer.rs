@@ -44,8 +44,17 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
 
     log::debug!("{:?}", printer);
 
-    // connect to the device
-    printer.connect().await?;
+    // it maybe powerless
+    tokio::select! {
+        _ = time::sleep(Duration::from_secs(2)) => {
+            log::error!(target: "init_printer", "printer timeout");
+            return Err(anyhow!("printer timeout"));
+        }
+        // connect to the device
+        _ = printer.connect() => {
+            log::debug!("connected to printer");
+        }
+    }
 
     // discover services and characteristics
     printer.discover_services().await?;
@@ -78,6 +87,18 @@ pub async fn call_printer(
     printer: &Peripheral,
     cmd_char: &Characteristic,
 ) -> anyhow::Result<()> {
+    // edge case: https://github.com/deviceplug/btleplug/issues/277
+    tokio::select! {
+        _ = time::sleep(Duration::from_secs(1)) => {
+            log::error!(target: "call_printer", "printer timeout");
+            return Err(anyhow!("printer timeout"));
+        }
+        // connect to the device
+        _ = printer.is_connected() => {
+            log::debug!("connected to printer");
+        }
+    }
+
     printer
         .write(cmd_char, ENABLE_PRINTER.as_slice(), WriteType::WithResponse)
         .await?;
