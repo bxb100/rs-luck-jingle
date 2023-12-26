@@ -76,11 +76,7 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
         .await?;
 
     printer
-        .write(
-            cmd_char,
-            ENABLE_PRINTER.as_slice(),
-            WriteType::WithResponse,
-        )
+        .write(cmd_char, ENABLE_PRINTER.as_slice(), WriteType::WithResponse)
         .await?;
 
     printer
@@ -92,11 +88,7 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
         .await?;
 
     printer
-        .write(
-            cmd_char,
-            SET_THICKNESS.as_slice(),
-            WriteType::WithResponse,
-        )
+        .write(cmd_char, SET_THICKNESS.as_slice(), WriteType::WithResponse)
         .await?;
 
     Ok((printer, cmd_char.clone()))
@@ -107,7 +99,17 @@ pub async fn call_printer(
     printer: &Peripheral,
     cmd_char: &Characteristic,
 ) -> anyhow::Result<()> {
-    _call_printer(None, Some(text), printer, cmd_char).await
+
+    tokio::select! {
+        _ = time::sleep(Duration::from_secs(30)) => {
+            log::error!(target: "call_printer", "printer timeout");
+            Err(anyhow!("printer timeout"))
+        }
+        // connect to the device
+        _ =_call_printer(None, Some(text), printer, cmd_char) => {
+           Ok(())
+        }
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -212,12 +214,7 @@ async fn find_printer(peripherals: Vec<Peripheral>) -> anyhow::Result<Peripheral
 #[tokio::test]
 async fn test_printer() {
     let (printer, cmd) = init_printer().await.unwrap();
-    _call_printer(
-        Some("./res/test_concat.png"),
-        None,
-        &printer,
-        &cmd,
-    )
-    .await
-    .unwrap();
+    _call_printer(Some("./res/test_concat.png"), None, &printer, &cmd)
+        .await
+        .unwrap();
 }
