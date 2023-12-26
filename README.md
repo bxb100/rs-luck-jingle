@@ -1,6 +1,6 @@
 # 叮当同学 D1 热敏打印机
 
-![demo](res/demo.jpg)
+[//]: # (![demo]&#40;res/demo.jpg&#41;)
 
 ## Webhook 设置
 
