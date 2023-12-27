@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use image::imageops::Gaussian;
 use image::{GenericImage, GenericImageView, ImageBuffer, Pixel, Primitive, Rgb, RgbImage};
 use imageproc::definitions::HasBlack;
@@ -14,12 +15,12 @@ static IMAGE_WIDTH: u32 = 384;
 
 /// https://github.com/yihong0618/blue
 /// https://github.com/andelf/text-image
-pub fn generate_image(src: Option<&str>, text: Option<&str>) -> Result<RgbImage, String> {
+pub fn generate_image(src: Option<&str>, text: Option<&str>) -> anyhow::Result<RgbImage> {
     if let Some(src) = src {
         return image::open(src)
             .map(|img| img.resize(IMAGE_WIDTH, img.height(), Gaussian))
             .map(|img| img.to_rgb8())
-            .map_err(|e| e.to_string());
+            .map_err(|e| anyhow::anyhow!("Can not open image: {}", e));
     } else if let Some(text) = text {
         // add --- in front and behind
         let mut text = format!("{}\n{}", "-".repeat(27), text);
@@ -85,7 +86,7 @@ pub fn generate_image(src: Option<&str>, text: Option<&str>) -> Result<RgbImage,
         return Ok(image);
     }
 
-    Err("Either src or text must be provided".to_string())
+    Err(anyhow!("Either src or text must be provided"))
 }
 
 #[allow(dead_code)]

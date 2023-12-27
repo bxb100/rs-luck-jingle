@@ -99,7 +99,6 @@ pub async fn call_printer(
     printer: &Peripheral,
     cmd_char: &Characteristic,
 ) -> anyhow::Result<()> {
-
     tokio::select! {
         _ = time::sleep(Duration::from_secs(30)) => {
             log::error!(target: "call_printer", "printer timeout");
@@ -122,8 +121,8 @@ async fn _call_printer(
     // edge case: https://github.com/deviceplug/btleplug/issues/277
     tokio::select! {
         _ = time::sleep(Duration::from_secs(1)) => {
-            log::error!(target: "call_printer", "printer timeout");
-            return Err(anyhow!("printer timeout"));
+            log::error!(target: "_call_printer", "printer connection timeout");
+            return Err(anyhow!("printer connection timeout"));
         }
         // connect to the device
         _ = printer.is_connected() => {
