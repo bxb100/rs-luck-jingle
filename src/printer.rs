@@ -16,6 +16,17 @@ async fn get_central(manager: &Manager) -> Adapter {
     adapters.into_iter().next().unwrap()
 }
 
+trait WriteExt {
+    async fn write_ext(&self, char: &Characteristic, data: &[u8]) -> anyhow::Result<()>;
+}
+
+impl WriteExt for Peripheral {
+    async fn write_ext(&self, char: &Characteristic, data: &[u8]) -> anyhow::Result<()> {
+        self.write(char, data, WriteType::WithResponse).await?;
+        Ok(())
+    }
+}
+
 pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
     let manager = Manager::new().await?;
 
@@ -67,29 +78,9 @@ pub async fn init_printer() -> anyhow::Result<(Peripheral, Characteristic)> {
     };
     let cmd_char = find_char(WRITE_UUID)?;
 
-    printer
-        .write(
-            cmd_char,
-            ENABLE_PRINTER_0.as_slice(),
-            WriteType::WithResponse,
-        )
-        .await?;
+    printer.write_ext(cmd_char, &DISABLE_SHUTDOWN).await?;
 
-    printer
-        .write(cmd_char, ENABLE_PRINTER.as_slice(), WriteType::WithResponse)
-        .await?;
-
-    printer
-        .write(
-            cmd_char,
-            DISABLE_SHUTDOWN.as_slice(),
-            WriteType::WithResponse,
-        )
-        .await?;
-
-    printer
-        .write(cmd_char, SET_THICKNESS.as_slice(), WriteType::WithResponse)
-        .await?;
+    printer.write_ext(cmd_char, &SET_THICKNESS).await?;
 
     Ok((printer, cmd_char.clone()))
 }
@@ -105,7 +96,7 @@ pub async fn call_printer(
             Err(anyhow!("printer timeout"))
         }
         // connect to the device
-        _ =_call_printer(None, Some(text), printer, cmd_char) => {
+        _ = _call_printer(None, Some(text), printer, cmd_char) => {
            Ok(())
         }
     }
@@ -130,13 +121,7 @@ async fn _call_printer(
         }
     }
 
-    printer
-        .write(
-            cmd_char,
-            PRINTER_WAKE_MAGIC.as_slice(),
-            WriteType::WithResponse,
-        )
-        .await?;
+    printer.write_ext(cmd_char, &PRINTER_WAKE_MAGIC).await?;
 
     let buffer = generate_image(img, text).unwrap();
 
@@ -161,11 +146,7 @@ async fn _call_printer(
     data += &image_hex_str[0..224];
 
     printer
-        .write(
-            cmd_char,
-            decode_hex(data.as_str()).unwrap().as_slice(),
-            WriteType::WithResponse,
-        )
+        .write_ext(cmd_char, &decode_hex(data.as_str()).unwrap())
         .await?;
 
     // send image data in chunks
@@ -173,22 +154,13 @@ async fn _call_printer(
         let str = &*format!("{:0<256}", unsafe {
             image_hex_str.get_unchecked(i..i + 256)
         });
+
         printer
-            .write(
-                cmd_char,
-                decode_hex(str).unwrap().as_slice(),
-                WriteType::WithResponse,
-            )
+            .write_ext(cmd_char, &decode_hex(str).unwrap())
             .await?;
     }
 
-    printer
-        .write(
-            cmd_char,
-            STOP_PRINT_JOBS.as_slice(),
-            WriteType::WithResponse,
-        )
-        .await?;
+    printer.write_ext(cmd_char, &STOP_PRINT_JOBS).await?;
 
     Ok(())
 }
