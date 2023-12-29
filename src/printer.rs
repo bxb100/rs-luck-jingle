@@ -96,8 +96,8 @@ pub async fn call_printer(
             Err(anyhow!("printer timeout"))
         }
         // connect to the device
-        _ = _call_printer(None, Some(text), printer, cmd_char) => {
-           Ok(())
+        res = _call_printer(None, Some(text), printer, cmd_char) => {
+           res
         }
     }
 }
