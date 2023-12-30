@@ -151,9 +151,9 @@ async fn _call_printer(
 
     // send image data in chunks
     for i in (224..image_hex_str.len()).step_by(256) {
-        let str = &*format!("{:0<256}", unsafe {
+        let str = &(*format!("{:0<256}", unsafe {
             image_hex_str.get_unchecked(i..i + 256)
-        });
+        }))[..256];
 
         printer
             .write_ext(cmd_char, &decode_hex(str).unwrap())
@@ -185,7 +185,7 @@ async fn find_printer(peripherals: Vec<Peripheral>) -> anyhow::Result<Peripheral
 #[tokio::test]
 async fn test_printer() {
     let (printer, cmd) = init_printer().await.unwrap();
-    _call_printer(Some("./res/test_concat.png"), None, &printer, &cmd)
+    _call_printer(Some("./res/img.png"), None, &printer, &cmd)
         .await
         .unwrap();
 }
