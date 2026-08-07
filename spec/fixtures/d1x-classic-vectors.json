@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "protocol": "luckp-d1x-classic",
+  "source": {
+    "android_package": "com.dingdang.newprint",
+    "android_version_name": "2.7.19",
+    "android_version_code": 657,
+    "device_name_prefix": "LuckP_D1X_",
+    "device_profile": "LuckP_D1X"
+  },
+  "transport": {
+    "kind": "bluetooth-classic-rfcomm",
+    "service_uuid": "00001101-0000-1000-8000-00805F9B34FB",
+    "observed_rfcomm_channel": 1,
+    "observed_rfcomm_mtu": 990,
+    "channel_source": "sdp",
+    "channel_configurable": true,
+    "mtu_is_informational": true,
+    "cancel_discovery_before_connect": true,
+    "post_cancel_discovery_delay_ms": 150,
+    "connect_primary": "secure",
+    "connect_fallback": "insecure",
+    "fallback_delay_ms": 150,
+    "write_delay_ms": 10,
+    "logical_write_chunk_bytes": 16384,
+    "flush_each_write_chunk": true,
+    "read_buffer_bytes": 8192,
+    "read_semantics": "byte-stream",
+    "android_response_dispatch": "single-read-chunk",
+    "implementation_should_accumulate": true,
+    "has_application_length_frame": false
+  },
+  "profile": {
+    "print_width_dots": 384,
+    "density_min": 0,
+    "density_max": 2,
+    "end_feed_dots": 80,
+    "enable_mode": 3,
+    "compression": false,
+    "grayscale": false,
+    "new_command_frame": false,
+    "raster_mode": 0,
+    "black_threshold": 128,
+    "bit_order": "msb-first",
+    "row_padding_bit": 0
+  },
+  "commands": {
+    "enable": {
+      "request_hex": "10 FF F1 03",
+      "expects_reply": false
+    },
+    "wake": {
+      "request_hex": "00 00 00 00 00 00 00 00 00 00 00 00",
+      "expects_reply": false
+    },
+    "status": {
+      "request_hex": "10 FF 40",
+      "expects_reply": true,
+      "timeout_ms": 3000,
+      "response_parser": "status-byte"
+    },
+    "set_density": {
+      "request_prefix_hex": "10 FF 10 00",
+      "parameter": {
+        "name": "level",
+        "encoding": "u8",
+        "min": 0,
+        "max": 2
+      },
+      "examples": [
+        {
+          "level": 0,
+          "request_hex": "10 FF 10 00 00"
+        },
+        {
+          "level": 1,
+          "request_hex": "10 FF 10 00 01"
+        },
+        {
+          "level": 2,
+          "request_hex": "10 FF 10 00 02"
+        }
+      ],
+      "expects_reply": true,
+      "timeout_ms": 3000,
+      "response_parser": "exact-ok"
+    },
+    "feed_dots": {
+      "request_prefix_hex": "1B 4A",
+      "parameter": {
+        "name": "dots",
+        "encoding": "u8",
+        "min": 0,
+        "max": 255
+      },
+      "default_dots": 80,
+      "default_request_hex": "1B 4A 50",
+      "expects_reply": false
+    },
+    "stop_job": {
+      "request_hex": "10 FF F1 45",
+      "expects_reply": true,
+      "timeout_ms": 70000,
+      "response_parser": "first-aa-or-gb2312-ok-prefix"
+    }
+  },
+  "raster_vectors": [
+    {
+      "name": "raster_8x1_alternating_black_first",
+      "width": 8,
+      "height": 1,
+      "mode": 0,
+      "pixels": [
+        [
+          "black",
+          "white",
+          "black",
+          "white",
+          "black",
+          "white",
+          "black",
+          "white"
+        ]
+      ],
+      "bytes_per_row": 1,
+      "header_hex": "1D 76 30 00 01 00 01 00",
+      "payload_hex": "AA",
+      "frame_hex": "1D 76 30 00 01 00 01 00 AA"
+    },
+    {
+      "name": "raster_9x1_all_black",
+      "width": 9,
+      "height": 1,
+      "mode": 0,
+      "pixels": [
+        [
+          "black",
+          "black",
+          "black",
+          "black",
+          "black",
+          "black",
+          "black",
+          "black",
+          "black"
+        ]
+      ],
+      "bytes_per_row": 2,
+      "right_padding_bits": 7,
+      "header_hex": "1D 76 30 00 02 00 01 00",
+      "payload_hex": "FF 80",
+      "frame_hex": "1D 76 30 00 02 00 01 00 FF 80"
+    }
+  ],
+  "response_vectors": [
+    {
+      "name": "status_idle",
+      "parser": "status-byte",
+      "response_hex": "00",
+      "expected": {
+        "printing": false,
+        "cover_open": false,
+        "paper_out": false,
+        "low_battery": false,
+        "charging": false,
+        "overheated": false
+      }
+    },
+    {
+      "name": "status_all_mapped_flags",
+      "parser": "status-byte",
+      "response_hex": "6F",
+      "expected": {
+        "printing": true,
+        "cover_open": true,
+        "paper_out": true,
+        "low_battery": true,
+        "charging": true,
+        "overheated": true
+      }
+    },
+    {
+      "name": "status_overheat_bit_4",
+      "parser": "status-byte",
+      "response_hex": "10",
+      "expected": {
+        "printing": false,
+        "cover_open": false,
+        "paper_out": false,
+        "low_battery": false,
+        "charging": false,
+        "overheated": true
+      }
+    },
+    {
+      "name": "density_ack_exact_ok",
+      "parser": "exact-ok",
+      "response_hex": "4F 4B",
+      "accepted": true
+    },
+    {
+      "name": "density_ack_with_trailing_newline",
+      "parser": "exact-ok",
+      "response_hex": "4F 4B 0D 0A",
+      "accepted": false
+    },
+    {
+      "name": "stop_ack_binary",
+      "parser": "first-aa-or-gb2312-ok-prefix",
+      "response_hex": "AA",
+      "accepted": true
+    },
+    {
+      "name": "stop_ack_text_prefix",
+      "parser": "first-aa-or-gb2312-ok-prefix",
+      "response_hex": "4F 4B 0D 0A",
+      "accepted": true
+    },
+    {
+      "name": "stop_ack_rejected",
+      "parser": "first-aa-or-gb2312-ok-prefix",
+      "response_hex": "45 52 52",
+      "accepted": false
+    }
+  ]
+}
