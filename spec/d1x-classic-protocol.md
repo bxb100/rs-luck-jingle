@@ -32,6 +32,9 @@
 | SPP UUID 为 `00001101-0000-1000-8000-00805F9B34FB` | A + B | 真机 SDP/RFCOMM 状态与 APK 连接代码一致 |
 | 当次真机 RFCOMM channel 为 `1`、MTU 为 `990` | A | 仅是该设备与该次协商结果，不是固定协议常量 |
 | 命令、响应规则和超时 | B | 来自 APK 的 D1X 普通打印路径；Status 命令已由 DEX 指令与 JADX 结果交叉核验 |
+| 自动关机命令、字节序和“手动关闭”取值 | B | 来自 APK `BaseNormalDevice` 的命令构造与 Android `2.7.19` 中文界面取值映射 |
+| Rust 启动初始化与欢迎小票 | A | `2026-08-08` 在 macOS 真机上主动发现 `LuckP_D1X_*`，密度与“手动关闭”均取得精确 `OK`，随后成功打印 `5384` 字节欢迎光栅 |
+| `30 s` 健康探测与重连调度 | A + C | Android D1X 没有专用心跳；Rust 在协议安全边界串行复用 Status；macOS 真机已验证空闲探测、helper/链路故障识别、自动重建 RFCOMM 和恢复后的 Status 往返 |
 | `GS v 0` 单色光栅格式 | B | 来自 APK 的默认 D1X 图像转换路径 |
 | 流式累计、请求串行化与禁止危险重放 | C | 用于弥补 Android 实现依赖单次 `read` 边界的问题 |
 
@@ -119,7 +122,7 @@ RFCOMM 是字节流；一次 `read` 的边界不是协议边界。新的实现�
 - 若一次读取包含无法明确归属当前请求的额外字节，或异步数据与同步回复发生无法拆分的合并，必须 fail closed。只有获得新的脱敏真机证据后，才能增加对应的分流规则和 fixtures。
 - 不得为本节命令发明统一长度帧或 `FC FF` 外层帧。
 
-状态回复只有首字节具有本文定义的意义；在没有多字节状态证据前，新的 Rust session 只接受恰好一个字节。密度回复必须精确匹配 `OK`；停止回复按第 8 节的两种终止条件判断。无法可靠分流的数据必须导致显式协议错误，而不是静默丢弃。
+状态回复只有首字节具有本文定义的意义；在没有多字节状态证据前，新的 Rust session 只接受恰好一个字节。密度和自动关机回复必须分别精确匹配 `OK`；停止回复按第 8 节的两种终止条件判断。无法可靠分流的数据必须导致显式协议错误，而不是静默丢弃。
 
 ## 5. D1X 默认能力配置
 
@@ -129,6 +132,7 @@ RFCOMM 是字节流；一次 `read` 的边界不是协议边界。新的实现�
 | --- | --- |
 | 打印宽度 | `384` dots |
 | 密度等级 | `0..2` |
+| Rust session 默认自动关机分钟数 | `0`，对应“手动关闭” |
 | 默认结束走纸 | `80` dots |
 | enable mode | `3` |
 | 图像压缩 | 禁用 |
@@ -139,7 +143,7 @@ RFCOMM 是字节流；一次 `read` 的边界不是协议边界。新的实现�
 
 ## 6. 命令
 
-除光栅数据外，本文范围内命令如下。`level` 和 `dots` 都编码为一个无符号字节。
+除光栅数据外，本文范围内命令如下。`level` 和 `dots` 都编码为一个无符号字节；`minutes` 编码为 big-endian `u16`，高字节在前。
 
 | 名称 | 请求字节 | 响应 | 超时 |
 | --- | --- | --- | --- |
@@ -147,12 +151,15 @@ RFCOMM 是字节流；一次 `read` 的边界不是协议边界。新的实现�
 | Wake | `00 00 00 00 00 00 00 00 00 00 00 00` | 无 | 无 |
 | Status | `10 FF 40` | Android 至少一个状态字节；Rust session 恰好一个 | `3 s` |
 | Set density | `10 FF 10 00 level` | 精确的 `4F 4B` | `3 s` |
+| Set auto shutdown | `10 FF 12 minutes_hi minutes_lo` | 精确的 `4F 4B` | `3 s` |
 | Feed dots | `1B 4A dots` | 无 | 无 |
 | Stop job | `10 FF F1 45` | 首字节 `AA`，或 GB2312 文本以 `OK` 开头 | `70 s` |
 
 Status 的末字节已通过原始 DEX 指令与 JADX 反编译结果交叉核验为 `40`；不得根据重构前 Rust 代码或符号常量名称改写为 `80`。
 
-密度命令只接受 `0`、`1`、`2`。默认结束走纸 `80` 的编码为 `50`，所以默认走纸命令为 `1B 4A 50`。
+密度命令只接受 `0`、`1`、`2`。自动关机参数是分钟数；Android `2.7.19` 中文界面的“手动关闭”精确映射为 `minutes=0`，对应命令 `10 FF 12 00 00`，不得把 `0` 解释为立即关机。默认结束走纸 `80` 的编码为 `50`，所以默认走纸命令为 `1B 4A 50`。
+
+新的 Rust session 默认使用“手动关闭”。每次 RFCOMM 连接成功后，包括首次连接和每次重连，都必须先设置密度并取得其精确 `OK`，再设置自动关机并独立取得精确 `OK`，之后才能进入 Ready。任一命令写入失败、超时或回复被拒绝时，必须关闭该脏连接。
 
 ## 7. 单色光栅编码
 
@@ -255,11 +262,17 @@ Status 回复的第一个字节按位解释：
 
 过热条件为 bit 4 或 bit 6 任意一个置位。Android 解析器只使用首字节，但额外状态字节的意义没有证据；新的 Rust session 因此只接受单字节状态回复。空回复、多字节回复、超时或在 deadline 内无法取得完整首字节均为失败。
 
+Android D1X 没有专用 ping/pong 命令。新的 Rust 服务复用 Status 作为连接健康探针：请求 `10 FF 40` 是 ping，`3 s` 内收到恰好一个可解析状态字节是 pong。健康探针只判断连接能否完成协议往返；缺纸、开盖、低电、过热或充电等非 Ready 状态仍属于健康 pong，不应触发重连。写入失败、读取失败、超时或回复长度异常必须关闭当前连接。
+
 ### 8.2 密度确认
 
 Set density 成功条件是 GB2312 解码后的整个回复精确等于 `OK`，对应字节 `4F 4B`。`OK` 后附带换行或其他字节不满足 Android 的精确判定，必须视为失败或无法分流的协议数据。
 
-### 8.3 停止确认
+### 8.3 自动关机确认
+
+Set auto shutdown 与密度命令使用相同的精确确认规则：整个回复必须恰好为 `4F 4B`。它使用普通响应超时 `3 s`；`OK` 后附带换行或其他字节不算成功。该确认只提交当前连接的自动关机配置，不能替代重连后的再次初始化。
+
+### 8.4 停止确认
 
 Stop job 成功条件满足其一即可：
 
@@ -272,19 +285,23 @@ Stop job 成功条件满足其一即可：
 
 Android 应用层与 SDK 层的时机不同，必须区分：
 
-1. 应用进入打印页、重新连接或修改打印属性时，异步调用密度设置。它不属于 SDK 单次普通卷纸打印函数内部的固定命令序列，点击打印时不会再次发送。
-2. 用户点击打印后，应用先检查连接，再发送 Status。状态获取失败或报告上盖打开、缺纸、低电量、过热、充电等阻断状态时，不进入打印准备；只有应用映射结果为 `-1` 的正常状态才继续。
-3. 状态允许后，应用生成或取得位图，再进入普通卷纸打印。
-4. SDK 依次发送 Enable、Wake、`GS v 0` 光栅、Feed dots、Stop job。
-5. Stop job 得到有效确认后，单次打印才算成功。
+1. Android 应用进入打印页、重新连接或修改打印属性时会设置密度；只有用户在设备设置界面选择自动关机选项时，才会发送自动关机命令。Android D1X 的连接初始化不会自动设置关机时间。
+2. 新的 Rust session 在首次连接及每次重连时，按密度、自动关机的顺序同步完成两项初始化。它们不属于单次打印作业内部的固定命令序列，Ready 长连接上的后续作业不会重复发送。
+3. 用户点击打印后，应用先检查连接，再发送 Status。状态获取失败或报告上盖打开、缺纸、低电量、过热、充电等阻断状态时，不进入打印准备；只有应用映射结果为 `-1` 的正常状态才继续。
+4. 状态允许后，应用生成或取得位图，再进入普通卷纸打印。
+5. SDK 依次发送 Enable、Wake、`GS v 0` 光栅、Feed dots、Stop job。
+6. Stop job 得到有效确认后，单次打印才算成功。
+7. Rust 服务在打印作业之外每隔 `30 s` 调度一次 Status 健康探测；探测只能在打印 worker 的协议安全边界执行，不能插入渲染完成后的单次打印命令序列。
 
 ```mermaid
 sequenceDiagram
     participant App
     participant Session
     participant Printer
-    App->>Session: Apply density when settings change
+    App->>Session: Connect or reconnect
     Session->>Printer: 10 FF 10 00 level
+    Printer-->>Session: Exact OK
+    Session->>Printer: 10 FF 12 minutes_hi minutes_lo
     Printer-->>Session: Exact OK
     App->>Session: Start print
     Session->>Printer: 10 FF 40
@@ -296,6 +313,10 @@ sequenceDiagram
     Session->>Printer: 10 FF F1 45
     Printer-->>Session: AA or OK prefix
     Session-->>App: Print result
+    loop Every 30 s at a protocol-safe boundary
+        Session->>Printer: 10 FF 40
+        Printer-->>Session: One status byte
+    end
 ```
 
 ## 10. 重实现状态机
@@ -306,13 +327,17 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Disconnected
     Disconnected --> ConnectingSecure: connect
-    ConnectingSecure --> Ready: connected
+    ConnectingSecure --> ConfiguringDensity: connected
     ConnectingSecure --> ConnectingInsecure: failed after 150 ms
-    ConnectingInsecure --> Ready: connected
+    ConnectingInsecure --> ConfiguringDensity: connected
     ConnectingInsecure --> Disconnected: failed
-    Ready --> Configuring: set density
-    Configuring --> Ready: exact OK
-    Configuring --> Faulted: timeout or invalid reply
+    ConfiguringDensity --> ConfiguringAutoShutdown: exact OK
+    ConfiguringDensity --> Faulted: timeout or invalid reply
+    ConfiguringAutoShutdown --> Ready: exact OK
+    ConfiguringAutoShutdown --> Faulted: timeout or invalid reply
+    Ready --> HealthChecking: 30 s probe due
+    HealthChecking --> Ready: one status byte
+    HealthChecking --> Faulted: timeout or invalid reply
     Ready --> CheckingStatus: start job
     CheckingStatus --> Printing: printable
     CheckingStatus --> Ready: printer blocked
@@ -329,7 +354,12 @@ stateDiagram-v2
 
 - 在发送首个作业字节前，连接失败可以安全重连；一旦开始发送光栅，禁止自动重放整个作业。
 - Status 超时或格式错误时应 fail closed，不发送 Enable 或光栅。
-- 显式设置密度时，只有精确 `OK` 才能提交新配置。
+- 每次新连接和重连都必须重新应用密度与自动关机，且自动关机必须排在密度之后。
+- 设置密度和自动关机时，每条命令都只有在独立收到精确 `OK` 后才能提交；任一配置失败都必须关闭连接。
+- 健康探测、重连初始化和打印必须由同一个 session owner 串行执行。不得由独立定时线程在打印期间写入 Status 或读取回复。
+- 健康探测失败后，空闲 worker 每隔 `30 s` 尝试一次重连；重连成功后必须重新应用密度和自动关机。新打印请求可以触发更早的连接尝试。
+- 长时间渲染或打印期间错过的健康周期只能在下一个安全边界合并为一次，不得积压或突发补发多个 Status。
+- 健康重连不得重复欢迎小票，也不得自动重放 RetrySafe 或 OutcomeUnknown 作业。
 - 任意 partial write、socket 错误或连接断开必须终止当前动作并关闭连接。
 - Stop job 超时或断开表示结果未知，不得把作业标记为成功，也不得自动重印。
 - 调用方只有在人工确认出纸情况或建立新的幂等策略后，才能重新提交结果未知的作业。
@@ -358,11 +388,14 @@ stateDiagram-v2
 1. 在 Linux 或 macOS 测试主机上清除该 D1X 的既有配对和信任状态；macOS 先为启动程序的宿主应用授予蓝牙权限。
 2. 由 Rust 程序主动执行 BR/EDR 发现；若出现多个候选，确认列表包含名称和 MAC，并人工选择目标设备。macOS 的 RSSI 可以显示为 `unknown`。
 3. Linux 由 BlueZ SPP profile 自动解析 channel；macOS 由 IOBluetooth 查询 SPP `0x1101` service record 并调用 `getRFCOMMChannelID`。记录解析值和协商 MTU，不持久化真实 MAC。
-4. 建立 RFCOMM 连接并发送 Status；确认 `3 s` 内可解析，且打印机处于可打印状态。
-5. 设置当前选定密度；确认回复精确为 `4F 4B`。
-6. 发送一张高度尽可能小、内容确定的单色测试图，仅打印一次。
-7. 发送 `1B 4A 50` 和 Stop job；记录收到 `AA` 还是 `OK` 前缀以及耗时。
-8. 对出纸结果检查宽度、MSB 顺序、行 padding 和是否只打印一次。
-9. 断开连接；若 Stop job 结果未知，停止测试并禁止自动重试。
+4. 建立 RFCOMM 连接，设置当前选定密度；确认回复精确为 `4F 4B`。
+5. 随后发送默认“手动关闭”命令 `10 FF 12 00 00`；确认它独立回复精确的 `4F 4B`。
+6. 发送 Status；确认 `3 s` 内可解析，且打印机处于可打印状态。
+7. 发送一张高度尽可能小、内容确定的单色测试图，仅打印一次。
+8. 发送 `1B 4A 50` 和 Stop job；记录收到 `AA` 还是 `OK` 前缀以及耗时。
+9. 对出纸结果检查宽度、MSB 顺序、行 padding 和是否只打印一次。
+10. 保持 worker 空闲至少 `30 s`，确认只发送一次 Status 探测并取得一个状态字节；确认该探测没有额外走纸或欢迎小票。
+11. 物理关闭打印机或中断链路，确认探测失败后 session 关闭连接，且空闲期间每隔 `30 s` 最多发起一次重连；重新开机后确认按密度、自动关机的顺序完成初始化，再取得健康 Status。
+12. 确认健康重连不会重复欢迎小票，也不会自动重放失败或结果未知的作业；若 Stop job 结果未知，停止测试并禁止自动重试。
 
-验证记录应至少包含 App 基线版本、打印机型号前缀、固件版本（若能无侵入读取）、各阶段耗时、脱敏十六进制响应和纸面结果。当前文档中的 A 级真机证据只确认 Classic SPP 链路、UUID、当次 channel/MTU；首次由新 Rust 实现完成的真实出纸结果应在完成后另行补充。
+验证记录应至少包含 App 基线版本、打印机型号前缀、固件版本（若能无侵入读取）、各阶段耗时、脱敏十六进制响应和纸面结果。`2026-08-08` 的 macOS 真机验证已确认新 Rust 实现能够主动发现 `LuckP_D1X_*`、建立 SPP/RFCOMM、设置默认浓度与“手动关闭”、查询可打印状态并输出一张 `5384` 字节的启动欢迎小票。空闲 `30 s` 后，Status 探测取得单字节正常状态；主动终止内部 RFCOMM helper 后，下一个探测周期识别到断链，并在约 `1 s` 内重建 helper、SPP/RFCOMM 和 session 配置，随后 Status 再次成功。恢复过程没有重复欢迎小票或重放打印作业，下一周期的健康探测也继续成功。真实 MAC 未写入规范；物理关闭打印机后的跨周期恢复仍可按第 11 步作为补充 HIL。

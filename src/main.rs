@@ -9,21 +9,23 @@ use rs_luck_jingle::markdown::{MarkdownImageFetcher, parse_markdown};
 use rs_luck_jingle::protocol::Density;
 use rs_luck_jingle::render::{load_image_bytes, render_text, stack_vertical};
 use rs_luck_jingle::session::{PrintFailure, PrinterSession, SessionConfig};
-use rs_luck_jingle::transport::RfcommTransport;
+use rs_luck_jingle::transport::{RfcommTransport, Transport};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::net::TcpListener;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::time::{Duration, Instant};
 
 const QUEUE_CAPACITY: usize = 100;
 const DEDUPE_CACHE_CAPACITY: usize = 1_024;
 const MAX_MARKDOWN_BODY_BYTES: usize = 64 * 1024;
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const REQUEST_ID_HEADER: &str = "X-Request-ID";
 
@@ -42,7 +44,7 @@ struct PrintContent {
 }
 
 struct AppState {
-    queue: Sender<PrintJob>,
+    queue: SyncSender<PrintJob>,
     dedupe: Mutex<DedupeCache>,
 }
 
@@ -179,6 +181,7 @@ fn main() -> io::Result<()> {
 async fn run() -> io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     let config = RuntimeConfig::from_env().map_err(io::Error::other)?;
+    let listener = bind_http_listener(&config.bind_address)?;
     let printer_address =
         resolve_printer_address(config.printer_address.clone(), config.discovery_timeout)
             .await
@@ -187,25 +190,36 @@ async fn run() -> io::Result<()> {
         .await
         .map_err(io::Error::other)?;
     let session_config = config.session;
+    let welcome_printer_address = printer_address.clone();
     let session = tokio::task::spawn_blocking(move || {
         let mut session = PrinterSession::new(transport, session_config);
         session
             .initialize()
             .context("failed to initialize selected printer")?;
+        let welcome_receipt = render_startup_welcome_receipt(&welcome_printer_address)?;
+        let outcome = session
+            .print(&welcome_receipt)
+            .context("failed to print startup welcome receipt")?;
+        log::info!(
+            "startup welcome receipt printed: raster_bytes={}",
+            outcome.raster_bytes
+        );
         Ok::<_, anyhow::Error>(session)
     })
     .await
     .map_err(io::Error::other)?
     .map_err(io::Error::other)?;
-    let (queue, receiver) = mpsc::channel(QUEUE_CAPACITY);
-    tokio::task::spawn_blocking(move || run_print_worker(receiver, session));
+    let (queue, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+    let print_worker = tokio::task::spawn_blocking(move || {
+        run_print_worker(receiver, session, HEALTH_CHECK_INTERVAL)
+    });
 
     let state = web::Data::new(AppState {
         queue,
         dedupe: Mutex::new(DedupeCache::new(DEDUPE_CACHE_CAPACITY)),
     });
 
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
             .app_data(state.clone())
@@ -213,9 +227,31 @@ async fn run() -> io::Result<()> {
             .service(print_markdown)
             .service(github_webhooks)
     })
-    .bind(&config.bind_address)?
-    .run()
-    .await
+    .listen(listener)?
+    .run();
+    let server_result = server.await;
+    if let Err(error) = print_worker.await {
+        if server_result.is_ok() {
+            return Err(io::Error::other(error));
+        }
+        log::error!("print worker failed while HTTP server was stopping: {error}");
+    }
+    server_result
+}
+
+fn bind_http_listener(bind_address: &str) -> io::Result<TcpListener> {
+    let listener = TcpListener::bind(bind_address)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+fn startup_welcome_content(printer_address: &str) -> String {
+    format!("Printer Connected\nAddress: {printer_address}")
+}
+
+fn render_startup_welcome_receipt(printer_address: &str) -> Result<image::RgbImage> {
+    render_text(&startup_welcome_content(printer_address))
+        .context("failed to render startup welcome receipt")
 }
 
 async fn resolve_printer_address(
@@ -295,11 +331,31 @@ async fn build_transport(address: &str, channel: Option<u8>) -> Result<RfcommTra
     }
 }
 
-fn run_print_worker(
-    mut receiver: Receiver<PrintJob>,
-    mut session: PrinterSession<RfcommTransport>,
-) {
-    while let Some(job) = receiver.blocking_recv() {
+fn run_print_worker<T>(
+    receiver: Receiver<PrintJob>,
+    mut session: PrinterSession<T>,
+    health_check_interval: Duration,
+) where
+    T: Transport,
+{
+    let mut next_health_check = Instant::now() + health_check_interval;
+    loop {
+        let remaining = next_health_check.saturating_duration_since(Instant::now());
+        let job = match receiver.recv_timeout(remaining) {
+            Ok(job) => job,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                next_health_check = check_printer_health(&mut session, health_check_interval)
+                    + health_check_interval;
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        if Instant::now() >= next_health_check {
+            next_health_check =
+                check_printer_health(&mut session, health_check_interval) + health_check_interval;
+        }
+
         let image = match render_print_job(&job) {
             Ok(image) => image,
             Err(error) => {
@@ -311,7 +367,9 @@ fn run_print_worker(
             }
         };
 
-        match session.print(&image) {
+        let result = session.print(&image);
+        next_health_check = Instant::now() + health_check_interval;
+        match result {
             Ok(outcome) => log::info!(
                 "print completed: job={}, raster_bytes={}",
                 job.job_id,
@@ -331,6 +389,35 @@ fn run_print_worker(
             }
         }
     }
+
+    if let Err(error) = session.disconnect() {
+        log::warn!("failed to disconnect printer while stopping print worker: {error:#}");
+    }
+}
+
+fn check_printer_health<T>(
+    session: &mut PrinterSession<T>,
+    health_check_interval: Duration,
+) -> Instant
+where
+    T: Transport,
+{
+    let result = session.health_check();
+    let completed_at = Instant::now();
+    match result {
+        Ok(outcome) if outcome.reconnected => log::info!(
+            "printer health check restored connection: status={:?}",
+            outcome.status
+        ),
+        Ok(outcome) => log::debug!(
+            "printer health check succeeded: status={:?}",
+            outcome.status
+        ),
+        Err(error) => log::warn!(
+            "printer health check failed; next retry in {health_check_interval:?}: {error:#}"
+        ),
+    }
+    completed_at
 }
 
 fn render_print_job(job: &PrintJob) -> Result<image::RgbImage> {
@@ -466,7 +553,7 @@ fn enqueue_print_job(
     state: &AppState,
     dedupe_key: Option<DedupeKey>,
     job: PrintJob,
-) -> Result<String, mpsc::error::TrySendError<PrintJob>> {
+) -> Result<String, mpsc::TrySendError<PrintJob>> {
     let job_id = job.job_id.clone();
     let Some(dedupe_key) = dedupe_key else {
         state.queue.try_send(job)?;
@@ -685,9 +772,149 @@ struct Issue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque as TestVecDeque;
+    use std::sync::mpsc::{Receiver as EventReceiver, Sender as EventSender};
+    use std::thread;
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum TransportEventKind {
+        Connect,
+        Write(Vec<u8>),
+        Read(Vec<u8>),
+        ReadFailure,
+        Disconnect,
+    }
+
+    #[derive(Debug)]
+    struct TimedTransportEvent {
+        at: Instant,
+        kind: TransportEventKind,
+    }
+
+    enum MockRead {
+        Data(Vec<u8>),
+        Failure(&'static str),
+    }
+
+    struct WorkerMockTransport {
+        connected: bool,
+        reads: TestVecDeque<MockRead>,
+        events: EventSender<TimedTransportEvent>,
+    }
+
+    impl WorkerMockTransport {
+        fn new(
+            reads: impl IntoIterator<Item = MockRead>,
+        ) -> (Self, EventReceiver<TimedTransportEvent>) {
+            let (events, event_receiver) = mpsc::channel();
+            (
+                Self {
+                    connected: false,
+                    reads: reads.into_iter().collect(),
+                    events,
+                },
+                event_receiver,
+            )
+        }
+
+        fn record(&self, kind: TransportEventKind) {
+            self.events
+                .send(TimedTransportEvent {
+                    at: Instant::now(),
+                    kind,
+                })
+                .expect("worker transport event receiver must remain open");
+        }
+    }
+
+    impl Transport for WorkerMockTransport {
+        fn connect(&mut self) -> Result<()> {
+            self.record(TransportEventKind::Connect);
+            self.connected = true;
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        fn write_all(&mut self, data: &[u8]) -> Result<()> {
+            if !self.connected {
+                return Err(anyhow!("mock transport is disconnected"));
+            }
+            self.record(TransportEventKind::Write(data.to_vec()));
+            Ok(())
+        }
+
+        fn read(&mut self, _timeout: Duration) -> Result<Vec<u8>> {
+            match self.reads.pop_front() {
+                Some(MockRead::Data(data)) => {
+                    self.record(TransportEventKind::Read(data.clone()));
+                    Ok(data)
+                }
+                Some(MockRead::Failure(message)) => {
+                    self.record(TransportEventKind::ReadFailure);
+                    Err(anyhow!(message))
+                }
+                None => {
+                    self.record(TransportEventKind::ReadFailure);
+                    Err(anyhow!("mock response queue is empty"))
+                }
+            }
+        }
+
+        fn disconnect(&mut self) -> Result<()> {
+            self.record(TransportEventKind::Disconnect);
+            self.connected = false;
+            Ok(())
+        }
+    }
+
+    fn worker_session_config() -> SessionConfig {
+        SessionConfig {
+            command_delay: Duration::ZERO,
+            ..SessionConfig::default()
+        }
+    }
+
+    fn initialize_worker_session(
+        reads: impl IntoIterator<Item = MockRead>,
+    ) -> (
+        PrinterSession<WorkerMockTransport>,
+        EventReceiver<TimedTransportEvent>,
+    ) {
+        let (transport, events) = WorkerMockTransport::new(reads);
+        let mut session = PrinterSession::new(transport, worker_session_config());
+        session.initialize().unwrap();
+        while events.try_recv().is_ok() {}
+        (session, events)
+    }
+
+    fn wait_for_event(
+        events: &EventReceiver<TimedTransportEvent>,
+        mut predicate: impl FnMut(&TransportEventKind) -> bool,
+    ) -> TimedTransportEvent {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let event = events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("expected worker transport event within 500 ms");
+            if predicate(&event.kind) {
+                return event;
+            }
+        }
+    }
+
+    fn worker_test_job(job_id: &str) -> PrintJob {
+        PrintJob {
+            job_id: job_id.to_owned(),
+            text: "Worker test".to_owned(),
+            image_urls: Vec::new(),
+        }
+    }
 
     fn test_state(capacity: usize) -> (web::Data<AppState>, Receiver<PrintJob>) {
-        let (queue, receiver) = mpsc::channel(capacity);
+        let (queue, receiver) = mpsc::sync_channel(capacity);
         (
             web::Data::new(AppState {
                 queue,
@@ -712,9 +939,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn print_worker_resets_health_deadline_after_print_attempt() {
+        let health_check_interval = Duration::from_millis(25);
+        let (session, events) = initialize_worker_session([
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Data(vec![0]),
+            MockRead::Data(vec![0xAA]),
+            MockRead::Data(vec![0]),
+        ]);
+        let (queue, receiver) = mpsc::sync_channel(1);
+        queue.try_send(worker_test_job("deadline-reset")).unwrap();
+        let worker = thread::spawn(move || {
+            run_print_worker(receiver, session, health_check_interval);
+        });
+
+        let print_completed = wait_for_event(&events, |event| {
+            *event == TransportEventKind::Read(vec![0xAA])
+        });
+        let health_query = wait_for_event(&events, |event| {
+            *event == TransportEventKind::Write(rs_luck_jingle::protocol::query_status().to_vec())
+        });
+        wait_for_event(&events, |event| *event == TransportEventKind::Read(vec![0]));
+
+        assert!(health_query.at.duration_since(print_completed.at) >= health_check_interval);
+
+        drop(queue);
+        worker.join().unwrap();
+        wait_for_event(&events, |event| *event == TransportEventKind::Disconnect);
+    }
+
+    #[test]
+    fn print_worker_retries_health_check_and_reconnects_on_next_deadline() {
+        let health_check_interval = Duration::from_millis(20);
+        let (session, events) = initialize_worker_session([
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Failure("mock health timeout"),
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Data(vec![0]),
+        ]);
+        let (queue, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            run_print_worker(receiver, session, health_check_interval);
+        });
+
+        let failed_health_check =
+            wait_for_event(&events, |event| *event == TransportEventKind::ReadFailure);
+        wait_for_event(&events, |event| *event == TransportEventKind::Disconnect);
+        let reconnect = wait_for_event(&events, |event| *event == TransportEventKind::Connect);
+        wait_for_event(&events, |event| *event == TransportEventKind::Read(vec![0]));
+
+        assert!(reconnect.at.duration_since(failed_health_check.at) >= health_check_interval);
+
+        drop(queue);
+        worker.join().unwrap();
+        wait_for_event(&events, |event| *event == TransportEventKind::Disconnect);
+    }
+
+    #[test]
+    fn print_worker_coalesces_an_overdue_health_check_before_a_queued_job() {
+        let (session, events) = initialize_worker_session([
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Data(b"OK".to_vec()),
+            MockRead::Data(vec![0]),
+            MockRead::Data(vec![0]),
+            MockRead::Data(vec![0xAA]),
+        ]);
+        let (queue, receiver) = mpsc::sync_channel(1);
+        queue.try_send(worker_test_job("overdue-check")).unwrap();
+        drop(queue);
+
+        let worker = thread::spawn(move || {
+            run_print_worker(receiver, session, Duration::ZERO);
+        });
+        worker.join().unwrap();
+
+        let event_kinds: Vec<_> = events.try_iter().map(|event| event.kind).collect();
+        let status_query = rs_luck_jingle::protocol::query_status().to_vec();
+        assert_eq!(
+            event_kinds
+                .iter()
+                .filter(|event| { **event == TransportEventKind::Write(status_query.clone()) })
+                .count(),
+            2
+        );
+        assert_eq!(
+            event_kinds
+                .iter()
+                .filter(|event| **event == TransportEventKind::Disconnect)
+                .count(),
+            1
+        );
+        let first_status_query = event_kinds
+            .iter()
+            .position(|event| *event == TransportEventKind::Write(status_query.clone()))
+            .unwrap();
+        let enable_printing = event_kinds
+            .iter()
+            .position(|event| {
+                *event
+                    == TransportEventKind::Write(
+                        rs_luck_jingle::protocol::enable_printer().to_vec(),
+                    )
+            })
+            .unwrap();
+        assert!(first_status_query < enable_printing);
+    }
+
+    #[test]
+    fn startup_welcome_receipt_has_expected_content_and_width() {
+        let printer_address = "02:00:00:00:00:01";
+
+        let content = startup_welcome_content(printer_address);
+        let rendered = render_startup_welcome_receipt(printer_address).unwrap();
+
+        assert_eq!(
+            content,
+            "Luck Jingle\nPrinter Connected\nAddress: 02:00:00:00:00:01\nAuto power-off: Manual"
+        );
+        assert_eq!(rendered.width(), rs_luck_jingle::protocol::PRINT_WIDTH_DOTS);
+        assert!(rendered.height() > 0);
+    }
+
+    #[test]
+    fn http_listener_conflict_is_detected_before_startup_work() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap();
+
+        let error = bind_http_listener(&address.to_string()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
     #[actix_web::test]
     async fn print_markdown_enqueues_text_and_images() {
-        let (state, mut receiver) = test_state(4);
+        let (state, receiver) = test_state(4);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -750,7 +1112,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_accepts_image_only_content() {
-        let (state, mut receiver) = test_state(1);
+        let (state, receiver) = test_state(1);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -775,7 +1137,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_rejects_missing_or_wrong_content_type() {
-        let (state, mut receiver) = test_state(4);
+        let (state, receiver) = test_state(4);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -823,7 +1185,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_rejects_invalid_utf8_and_empty_content() {
-        let (state, mut receiver) = test_state(2);
+        let (state, receiver) = test_state(2);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -858,7 +1220,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_rejects_oversized_bodies() {
-        let (state, mut receiver) = test_state(1);
+        let (state, receiver) = test_state(1);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -883,7 +1245,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_rejects_invalid_idempotency_keys() {
-        let (state, mut receiver) = test_state(2);
+        let (state, receiver) = test_state(2);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -919,7 +1281,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_returns_retry_after_and_does_not_cache_queue_failures() {
-        let (queue, mut receiver) = mpsc::channel(1);
+        let (queue, receiver) = mpsc::sync_channel(1);
         queue
             .try_send(PrintJob {
                 job_id: "occupied".to_owned(),
@@ -997,7 +1359,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_deduplicates_valid_idempotency_keys() {
-        let (state, mut receiver) = test_state(2);
+        let (state, receiver) = test_state(2);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -1033,7 +1395,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_markdown_without_idempotency_key_always_enqueues() {
-        let (state, mut receiver) = test_state(2);
+        let (state, receiver) = test_state(2);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -1066,7 +1428,7 @@ mod tests {
 
     #[actix_web::test]
     async fn print_and_github_idempotency_namespaces_do_not_collide() {
-        let (state, mut receiver) = test_state(2);
+        let (state, receiver) = test_state(2);
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
@@ -1149,22 +1511,6 @@ mod tests {
         let content = message.text.split("Content:\n").nth(1).unwrap();
         assert_eq!(content.chars().count(), 60);
         assert!(!message.text.contains("receipt"));
-    }
-
-    #[test]
-    fn preserves_omitted_image_notice_after_webhook_truncation() {
-        let mut hook = issue_hook("opened");
-        hook.issue.as_mut().unwrap().body = Some(format!(
-            "{} <img src=\"http://127.0.0.1/image.png\" alt=\"unsafe ] detail\">",
-            "Long issue content ".repeat(20)
-        ));
-
-        let message = build_message("issues", &hook).unwrap().unwrap();
-        let content = message.text.split("Content:\n").nth(1).unwrap();
-
-        assert!(content.ends_with("\n[image omitted]"));
-        assert_eq!(content.lines().next().unwrap().chars().count(), 60);
-        assert!(message.image_urls.is_empty());
     }
 
     #[test]

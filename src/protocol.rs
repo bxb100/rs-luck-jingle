@@ -3,6 +3,7 @@ use std::fmt;
 
 pub const PRINT_WIDTH_DOTS: u32 = 384;
 pub const DEFAULT_FEED_DOTS: u8 = 80;
+pub const DEFAULT_AUTO_SHUTDOWN_MINUTES: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -116,6 +117,11 @@ pub const fn set_density(density: Density) -> [u8; 5] {
     [0x10, 0xff, 0x10, 0x00, density as u8]
 }
 
+pub const fn set_auto_shutdown(minutes: u16) -> [u8; 5] {
+    let [minutes_high, minutes_low] = minutes.to_be_bytes();
+    [0x10, 0xff, 0x12, minutes_high, minutes_low]
+}
+
 pub const fn feed_dots(dots: u8) -> [u8; 3] {
     [0x1b, 0x4a, dots]
 }
@@ -208,8 +214,19 @@ mod tests {
         assert_eq!(set_density(Density::Light), [0x10, 0xff, 0x10, 0x00, 0]);
         assert_eq!(set_density(Density::Normal), [0x10, 0xff, 0x10, 0x00, 1]);
         assert_eq!(set_density(Density::Dark), [0x10, 0xff, 0x10, 0x00, 2]);
+        assert_eq!(
+            set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+            [0x10, 0xff, 0x12, 0x00, 0x00]
+        );
         assert_eq!(feed_dots(DEFAULT_FEED_DOTS), [0x1b, 0x4a, 0x50]);
         assert_eq!(stop_print_job(), [0x10, 0xff, 0xf1, 0x45]);
+    }
+
+    #[test]
+    fn auto_shutdown_minutes_use_big_endian_u16_encoding() {
+        assert_eq!(set_auto_shutdown(1), [0x10, 0xff, 0x12, 0x00, 0x01]);
+        assert_eq!(set_auto_shutdown(256), [0x10, 0xff, 0x12, 0x01, 0x00]);
+        assert_eq!(set_auto_shutdown(u16::MAX), [0x10, 0xff, 0x12, 0xff, 0xff]);
     }
 
     #[test]

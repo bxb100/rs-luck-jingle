@@ -1,7 +1,7 @@
 use crate::protocol::{
-    DEFAULT_FEED_DOTS, Density, PrinterStatus, enable_printer, encode_raster, feed_dots,
-    is_ok_response, is_stop_ack, parse_status, query_status, set_density, stop_print_job,
-    wake_printer,
+    DEFAULT_AUTO_SHUTDOWN_MINUTES, DEFAULT_FEED_DOTS, Density, PrinterStatus, enable_printer,
+    encode_raster, feed_dots, is_ok_response, is_stop_ack, parse_status, query_status,
+    set_auto_shutdown, set_density, stop_print_job, wake_printer,
 };
 use crate::transport::Transport;
 use anyhow::{Context, Result, anyhow};
@@ -24,6 +24,7 @@ pub enum SessionState {
 #[derive(Clone, Copy, Debug)]
 pub struct SessionConfig {
     pub density: Density,
+    pub auto_shutdown_minutes: u16,
     pub feed_dots: u8,
     pub command_delay: Duration,
     pub response_timeout: Duration,
@@ -34,6 +35,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             density: Density::Normal,
+            auto_shutdown_minutes: DEFAULT_AUTO_SHUTDOWN_MINUTES,
             feed_dots: DEFAULT_FEED_DOTS,
             command_delay: Duration::from_millis(10),
             response_timeout: Duration::from_secs(3),
@@ -46,6 +48,12 @@ impl Default for SessionConfig {
 pub struct PrintOutcome {
     pub raster_bytes: usize,
     pub status: PrinterStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HealthCheckOutcome {
+    pub status: PrinterStatus,
+    pub reconnected: bool,
 }
 
 #[derive(Debug)]
@@ -112,7 +120,23 @@ where
     }
 
     pub fn initialize(&mut self) -> Result<()> {
-        self.ensure_ready()
+        self.ensure_ready().map(|_| ())
+    }
+
+    pub fn health_check(&mut self) -> Result<HealthCheckOutcome> {
+        let reconnected = self.ensure_ready()?;
+        let status = match self.read_status() {
+            Ok(status) => status,
+            Err(error) => {
+                self.close_dirty_session();
+                return Err(error);
+            }
+        };
+
+        Ok(HealthCheckOutcome {
+            status,
+            reconnected,
+        })
     }
 
     pub fn print(&mut self, image: &RgbImage) -> std::result::Result<PrintOutcome, PrintFailure> {
@@ -152,9 +176,9 @@ where
         result
     }
 
-    fn ensure_ready(&mut self) -> Result<()> {
+    fn ensure_ready(&mut self) -> Result<bool> {
         if self.state == SessionState::Ready && self.transport.is_connected() {
-            return Ok(());
+            return Ok(false);
         }
 
         self.state = SessionState::Connecting;
@@ -174,8 +198,18 @@ where
             return Err(error);
         }
 
+        let auto_shutdown = set_auto_shutdown(self.config.auto_shutdown_minutes);
+        if let Err(error) = self.write_command(&auto_shutdown).and_then(|_| {
+            self.read_until(self.config.response_timeout, is_ok_response)
+                .map(|_| ())
+                .context("printer rejected auto-shutdown command")
+        }) {
+            self.close_dirty_session();
+            return Err(error);
+        }
+
         self.state = SessionState::Ready;
-        Ok(())
+        Ok(true)
     }
 
     fn read_status(&mut self) -> Result<PrinterStatus> {
@@ -369,7 +403,7 @@ mod tests {
 
     #[test]
     fn initializes_connection_before_accepting_print_jobs() {
-        let (transport, handle) = MockTransport::new([b"OK".to_vec()]);
+        let (transport, handle) = MockTransport::new([b"OK".to_vec(), b"OK".to_vec()]);
         let mut session = PrinterSession::new(transport, test_config());
 
         session.initialize().unwrap();
@@ -377,13 +411,213 @@ mod tests {
         assert_eq!(session.state(), SessionState::Ready);
         assert_eq!(
             handle.writes.lock().unwrap().as_slice(),
-            [set_density(Density::Normal)]
+            [
+                set_density(Density::Normal),
+                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+            ]
         );
     }
 
     #[test]
+    fn reapplies_initialization_after_reconnect() {
+        let (transport, handle) = MockTransport::new([
+            b"OK".to_vec(),
+            b"OK".to_vec(),
+            b"OK".to_vec(),
+            b"OK".to_vec(),
+        ]);
+        let mut session = PrinterSession::new(transport, test_config());
+
+        session.initialize().unwrap();
+        session.disconnect().unwrap();
+        session.initialize().unwrap();
+
+        assert_eq!(session.state(), SessionState::Ready);
+        assert_eq!(
+            handle.writes.lock().unwrap().as_slice(),
+            [
+                set_density(Density::Normal),
+                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+                set_density(Density::Normal),
+                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+            ]
+        );
+        assert_eq!(*handle.disconnects.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn health_check_only_queries_status_on_ready_connection() {
+        let (transport, handle) =
+            MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0], vec![0]]);
+        let mut session = PrinterSession::new(transport, test_config());
+
+        let initial = session.health_check().unwrap();
+        let idle = session.health_check().unwrap();
+
+        assert_eq!(
+            initial,
+            HealthCheckOutcome {
+                status: PrinterStatus::from_byte(0),
+                reconnected: true,
+            }
+        );
+        assert_eq!(
+            idle,
+            HealthCheckOutcome {
+                status: PrinterStatus::from_byte(0),
+                reconnected: false,
+            }
+        );
+        assert_eq!(session.state(), SessionState::Ready);
+        assert_eq!(
+            handle.writes.lock().unwrap().as_slice(),
+            [
+                set_density(Density::Normal).to_vec(),
+                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES).to_vec(),
+                query_status().to_vec(),
+                query_status().to_vec(),
+            ]
+        );
+        assert_eq!(*handle.disconnects.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn health_check_treats_non_ready_status_as_healthy() {
+        let status_byte = 0b0000_0100;
+        let (transport, handle) =
+            MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![status_byte]]);
+        let mut session = PrinterSession::new(transport, test_config());
+
+        let outcome = session.health_check().unwrap();
+
+        assert_eq!(outcome.status, PrinterStatus::from_byte(status_byte));
+        assert!(!outcome.status.is_ready());
+        assert!(outcome.reconnected);
+        assert_eq!(session.state(), SessionState::Ready);
+        assert_eq!(*handle.disconnects.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn health_check_status_write_failure_disconnects_session() {
+        let (transport, handle) = MockTransport::new([b"OK".to_vec(), b"OK".to_vec()]);
+        let mut session = PrinterSession::new(transport.failing_write_at(2), test_config());
+
+        let error = session.health_check().unwrap_err();
+
+        assert!(format!("{error:#}").contains("mock write failed at index 2"));
+        assert_eq!(session.state(), SessionState::Disconnected);
+        assert_eq!(*handle.disconnects.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn health_check_invalid_status_disconnects_session() {
+        let (transport, handle) =
+            MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0, 0xAA]]);
+        let mut session = PrinterSession::new(transport, test_config());
+
+        let error = session.health_check().unwrap_err();
+
+        assert!(error.to_string().contains("expected exactly 1 byte"));
+        assert_eq!(session.state(), SessionState::Disconnected);
+        assert_eq!(*handle.disconnects.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn health_check_reconnects_and_reinitializes_after_status_timeout() {
+        let (transport, handle) = MockTransport::with_results([
+            Ok(b"OK".to_vec()),
+            Ok(b"OK".to_vec()),
+            Err(anyhow!("mock status timeout")),
+            Ok(b"OK".to_vec()),
+            Ok(b"OK".to_vec()),
+            Ok(vec![0]),
+        ]);
+        let mut session = PrinterSession::new(transport, test_config());
+
+        let first_error = session.health_check().unwrap_err();
+
+        assert!(format!("{first_error:#}").contains("mock status timeout"));
+        assert_eq!(session.state(), SessionState::Disconnected);
+        assert_eq!(*handle.disconnects.lock().unwrap(), 1);
+
+        let recovered = session.health_check().unwrap();
+
+        assert_eq!(
+            recovered,
+            HealthCheckOutcome {
+                status: PrinterStatus::from_byte(0),
+                reconnected: true,
+            }
+        );
+        assert_eq!(session.state(), SessionState::Ready);
+        assert_eq!(
+            handle.writes.lock().unwrap().as_slice(),
+            [
+                set_density(Density::Normal).to_vec(),
+                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES).to_vec(),
+                query_status().to_vec(),
+                set_density(Density::Normal).to_vec(),
+                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES).to_vec(),
+                query_status().to_vec(),
+            ]
+        );
+        assert_eq!(*handle.disconnects.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn reapplies_initialization_after_dirty_session_recovery() {
+        let (transport, handle) = MockTransport::new([
+            b"OK".to_vec(),
+            b"OK".to_vec(),
+            vec![0, 0xAA],
+            b"OK".to_vec(),
+            b"OK".to_vec(),
+            vec![0],
+            vec![0xAA],
+        ]);
+        let mut session = PrinterSession::new(transport, test_config());
+        let image = RgbImage::new(8, 1);
+
+        let first_error = session.print(&image).unwrap_err();
+        assert!(matches!(first_error, PrintFailure::RetrySafe(_)));
+        assert_eq!(session.state(), SessionState::Disconnected);
+
+        session.print(&image).unwrap();
+
+        let writes = handle.writes.lock().unwrap();
+        assert_eq!(writes[0], set_density(Density::Normal));
+        assert_eq!(writes[1], set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES));
+        assert_eq!(writes[2], query_status());
+        assert_eq!(writes[3], set_density(Density::Normal));
+        assert_eq!(writes[4], set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES));
+        assert_eq!(writes[5], query_status());
+        assert_eq!(*handle.disconnects.lock().unwrap(), 1);
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    #[test]
+    fn closes_connection_when_auto_shutdown_is_rejected() {
+        let (transport, handle) = MockTransport::new([b"OK".to_vec(), b"NO".to_vec()]);
+        let mut session = PrinterSession::new(transport, test_config());
+
+        let error = session.initialize().unwrap_err();
+
+        assert!(format!("{error:#}").contains("printer rejected auto-shutdown command"));
+        assert_eq!(session.state(), SessionState::Disconnected);
+        assert_eq!(
+            handle.writes.lock().unwrap().as_slice(),
+            [
+                set_density(Density::Normal),
+                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+            ]
+        );
+        assert_eq!(*handle.disconnects.lock().unwrap(), 1);
+    }
+
+    #[test]
     fn sends_android_command_sequence_and_waits_for_ack() {
-        let (transport, handle) = MockTransport::new([b"OK".to_vec(), vec![0], vec![0xAA]]);
+        let (transport, handle) =
+            MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0], vec![0xAA]]);
         let mut session = PrinterSession::new(transport, test_config());
         let mut image = RgbImage::new(8, 1);
         for (index, pixel) in image.pixels_mut().enumerate() {
@@ -399,22 +633,24 @@ mod tests {
         assert_eq!(session.state(), SessionState::Ready);
         assert_eq!(outcome.raster_bytes, 9);
         let writes = handle.writes.lock().unwrap();
-        assert_eq!(writes.len(), 7);
+        assert_eq!(writes.len(), 8);
         assert_eq!(writes[0], set_density(Density::Normal));
-        assert_eq!(writes[1], query_status());
-        assert_eq!(writes[2], enable_printer());
-        assert_eq!(writes[3], wake_printer());
+        assert_eq!(writes[1], set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES));
+        assert_eq!(writes[2], query_status());
+        assert_eq!(writes[3], enable_printer());
+        assert_eq!(writes[4], wake_printer());
         assert_eq!(
-            writes[4],
+            writes[5],
             [vec![0x1D, 0x76, 0x30, 0, 1, 0, 1, 0], vec![0xAA]].concat()
         );
-        assert_eq!(writes[5], feed_dots(DEFAULT_FEED_DOTS));
-        assert_eq!(writes[6], stop_print_job());
+        assert_eq!(writes[6], feed_dots(DEFAULT_FEED_DOTS));
+        assert_eq!(writes[7], stop_print_job());
     }
 
     #[test]
     fn keeps_ready_connection_when_status_blocks_printing() {
-        let (transport, handle) = MockTransport::new([b"OK".to_vec(), vec![0b0000_0100]]);
+        let (transport, handle) =
+            MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0b0000_0100]]);
         let mut session = PrinterSession::new(transport, test_config());
         let image = RgbImage::new(8, 1);
 
@@ -423,13 +659,14 @@ mod tests {
         assert!(matches!(error, PrintFailure::RetrySafe(_)));
         assert!(error.to_string().contains("not ready"));
         assert_eq!(session.state(), SessionState::Ready);
-        assert_eq!(handle.writes.lock().unwrap().len(), 2);
+        assert_eq!(handle.writes.lock().unwrap().len(), 3);
         assert_eq!(*handle.disconnects.lock().unwrap(), 0);
     }
 
     #[test]
     fn rejects_multi_byte_status_responses() {
-        let (transport, handle) = MockTransport::new([b"OK".to_vec(), vec![0, 0xAA]]);
+        let (transport, handle) =
+            MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0, 0xAA]]);
         let mut session = PrinterSession::new(transport, test_config());
 
         let error = session.print(&RgbImage::new(8, 1)).unwrap_err();
@@ -448,6 +685,7 @@ mod tests {
     #[test]
     fn rejects_unverified_async_stop_response() {
         let (transport, handle) = MockTransport::new([
+            b"OK".to_vec(),
             b"OK".to_vec(),
             vec![0],
             vec![0xFF, 0x02],
@@ -471,6 +709,8 @@ mod tests {
     #[test]
     fn reassembles_split_ok_responses() {
         let (transport, _) = MockTransport::new([
+            b"O".to_vec(),
+            b"K".to_vec(),
             b"O".to_vec(),
             b"K".to_vec(),
             vec![0],
@@ -499,8 +739,8 @@ mod tests {
 
     #[test]
     fn failure_before_raster_write_is_retry_safe() {
-        let (transport, handle) = MockTransport::new([b"OK".to_vec(), vec![0]]);
-        let mut session = PrinterSession::new(transport.failing_write_at(3), test_config());
+        let (transport, handle) = MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0]]);
+        let mut session = PrinterSession::new(transport.failing_write_at(4), test_config());
 
         let error = session.print(&RgbImage::new(8, 1)).unwrap_err();
 
@@ -511,8 +751,8 @@ mod tests {
 
     #[test]
     fn raster_write_failure_makes_outcome_unknown() {
-        let (transport, handle) = MockTransport::new([b"OK".to_vec(), vec![0]]);
-        let mut session = PrinterSession::new(transport.failing_write_at(4), test_config());
+        let (transport, handle) = MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0]]);
+        let mut session = PrinterSession::new(transport.failing_write_at(5), test_config());
 
         let error = session.print(&RgbImage::new(8, 1)).unwrap_err();
 
@@ -523,7 +763,7 @@ mod tests {
 
     #[test]
     fn stop_timeout_makes_outcome_unknown() {
-        let (transport, handle) = MockTransport::new([b"OK".to_vec(), vec![0]]);
+        let (transport, handle) = MockTransport::new([b"OK".to_vec(), b"OK".to_vec(), vec![0]]);
         let mut config = test_config();
         config.stop_timeout = Duration::ZERO;
         let mut session = PrinterSession::new(transport, config);
@@ -539,6 +779,7 @@ mod tests {
     #[test]
     fn stop_read_error_makes_outcome_unknown() {
         let (transport, handle) = MockTransport::with_results([
+            Ok(b"OK".to_vec()),
             Ok(b"OK".to_vec()),
             Ok(vec![0]),
             Err(anyhow!("mock stop read failed")),

@@ -881,6 +881,7 @@ enum HelperInput {
 
 pub(crate) struct MacRfcommBackend {
     address: String,
+    channel: Option<u8>,
     helper: Mutex<HelperProcess>,
     connected: AtomicBool,
 }
@@ -892,19 +893,11 @@ impl MacRfcommBackend {
             validate_channel(channel)?;
         }
 
-        let mut helper = HelperProcess::spawn()?;
-        helper
-            .request(
-                HelperRequest::Initialize {
-                    address: address.clone(),
-                    channel,
-                },
-                HELPER_START_TIMEOUT,
-            )
-            .context("failed to initialize the macOS RFCOMM helper")?;
+        let helper = spawn_initialized_helper(&address, channel)?;
 
         Ok(Self {
             address,
+            channel,
             helper: Mutex::new(helper),
             connected: AtomicBool::new(false),
         })
@@ -912,7 +905,7 @@ impl MacRfcommBackend {
 
     pub(crate) fn connect(&mut self) -> Result<()> {
         let result = self
-            .request(HelperRequest::Connect, CONNECT_REPLY_TIMEOUT)
+            .connect_with_supervision()
             .with_context(|| format!("failed to connect RFCOMM device {}", self.address));
         self.connected.store(result.is_ok(), Ordering::Release);
         result.map(|_| ())
@@ -979,6 +972,82 @@ impl MacRfcommBackend {
             .map_err(|_| anyhow!("macOS RFCOMM helper lock was poisoned"))?
             .request(request, timeout)
     }
+
+    fn connect_with_supervision(&self) -> Result<Vec<u8>> {
+        let mut helper = self
+            .helper
+            .lock()
+            .map_err(|_| anyhow!("macOS RFCOMM helper lock was poisoned"))?;
+
+        if !helper.is_usable() {
+            *helper = spawn_initialized_helper(&self.address, self.channel)
+                .context("failed to restart the macOS RFCOMM helper before connecting")?;
+        }
+
+        match helper.request(HelperRequest::Connect, CONNECT_REPLY_TIMEOUT) {
+            Ok(response) => Ok(response),
+            Err(first_error) => {
+                let helper_usable = helper.is_usable();
+                if !should_retry_connect(true, helper_usable) {
+                    return Err(first_error);
+                }
+
+                log::debug!(
+                    "restarting the macOS RFCOMM helper after it failed while connecting to {}: {first_error:#}",
+                    self.address
+                );
+                *helper = spawn_initialized_helper(&self.address, self.channel).with_context(|| {
+                    format!(
+                        "failed to restart the macOS RFCOMM helper after a connect attempt failed: {first_error:#}"
+                    )
+                })?;
+                helper.request(HelperRequest::Connect, CONNECT_REPLY_TIMEOUT)
+            }
+        }
+    }
+}
+
+fn spawn_initialized_helper(address: &str, channel: Option<u8>) -> Result<HelperProcess> {
+    let mut helper = HelperProcess::spawn()?;
+    helper
+        .request(
+            HelperRequest::Initialize {
+                address: address.to_owned(),
+                channel,
+            },
+            HELPER_START_TIMEOUT,
+        )
+        .context("failed to initialize the macOS RFCOMM helper")?;
+    Ok(helper)
+}
+
+fn should_retry_connect(request_failed: bool, helper_usable: bool) -> bool {
+    request_failed && !helper_usable
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HelperChildState {
+    Missing,
+    Running,
+    Exited,
+    Uninspectable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HelperResponseReaderState {
+    Missing,
+    Running,
+    Finished,
+}
+
+fn helper_state_is_usable(
+    child_state: HelperChildState,
+    input_available: bool,
+    response_reader_state: HelperResponseReaderState,
+) -> bool {
+    child_state == HelperChildState::Running
+        && input_available
+        && response_reader_state == HelperResponseReaderState::Running
 }
 
 struct HelperProcess {
@@ -1039,6 +1108,31 @@ impl HelperProcess {
             responses,
             response_reader: Some(response_reader),
         })
+    }
+
+    fn is_usable(&mut self) -> bool {
+        let child_state = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => HelperChildState::Running,
+                Ok(Some(_)) => HelperChildState::Exited,
+                Err(error) => {
+                    log::debug!("failed to inspect the macOS RFCOMM helper: {error}");
+                    HelperChildState::Uninspectable
+                }
+            },
+            None => HelperChildState::Missing,
+        };
+        let response_reader_state = match self.response_reader.as_ref() {
+            Some(reader) if reader.is_finished() => HelperResponseReaderState::Finished,
+            Some(_) => HelperResponseReaderState::Running,
+            None => HelperResponseReaderState::Missing,
+        };
+        let usable =
+            helper_state_is_usable(child_state, self.input.is_some(), response_reader_state);
+        if !usable {
+            self.terminate();
+        }
+        usable
     }
 
     fn request(&mut self, request: HelperRequest, timeout: Duration) -> Result<Vec<u8>> {
@@ -1908,6 +2002,58 @@ mod tests {
         let failure = encode_helper_response(HelperOpcode::Connect as u8, Err(anyhow!(long_error)));
         assert_eq!(failure.len(), 2 + MAX_HELPER_ERROR_BYTES);
         assert!(decode_helper_response(&failure, HelperOpcode::Connect).is_err());
+    }
+
+    #[test]
+    fn backend_retains_explicit_and_discovered_channels() {
+        for channel in [None, Some(7)] {
+            let (_response_tx, responses) = mpsc::sync_channel(1);
+            let backend = MacRfcommBackend {
+                address: "AA:BB:CC:DD:EE:FF".to_owned(),
+                channel,
+                helper: Mutex::new(HelperProcess {
+                    child: None,
+                    input: None,
+                    responses,
+                    response_reader: None,
+                }),
+                connected: AtomicBool::new(false),
+            };
+
+            assert_eq!(backend.channel, channel);
+        }
+    }
+
+    #[test]
+    fn helper_state_requires_a_running_child_and_live_io_resources() {
+        assert!(helper_state_is_usable(
+            HelperChildState::Running,
+            true,
+            HelperResponseReaderState::Running
+        ));
+        assert!(!helper_state_is_usable(
+            HelperChildState::Exited,
+            true,
+            HelperResponseReaderState::Running
+        ));
+        assert!(!helper_state_is_usable(
+            HelperChildState::Running,
+            false,
+            HelperResponseReaderState::Running
+        ));
+        assert!(!helper_state_is_usable(
+            HelperChildState::Running,
+            true,
+            HelperResponseReaderState::Finished
+        ));
+    }
+
+    #[test]
+    fn connect_retry_requires_a_failed_request_and_an_unusable_helper() {
+        assert!(should_retry_connect(true, false));
+        assert!(!should_retry_connect(true, true));
+        assert!(!should_retry_connect(false, false));
+        assert!(!should_retry_connect(false, true));
     }
 
     #[test]

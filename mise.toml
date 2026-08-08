@@ -1,5 +1,5 @@
 [env]
-LUCK_JINGLE_DENSITY = 0
+LUCK_JINGLE_DENSITY = 1
 
 [tasks.print]
 description = "Print demo image"

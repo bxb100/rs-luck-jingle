@@ -1,8 +1,8 @@
 use image::{Rgb, RgbImage};
 use rs_luck_jingle::protocol::{
-    Density, PRINT_WIDTH_DOTS, PrinterStatus, enable_printer, encode_raster, feed_dots,
-    is_ok_response, is_stop_ack, parse_status, query_status, set_density, stop_print_job,
-    wake_printer,
+    DEFAULT_AUTO_SHUTDOWN_MINUTES, Density, PRINT_WIDTH_DOTS, PrinterStatus, enable_printer,
+    encode_raster, feed_dots, is_ok_response, is_stop_ack, parse_status, query_status,
+    set_auto_shutdown, set_density, stop_print_job, wake_printer,
 };
 use rs_luck_jingle::session::SessionConfig;
 use rs_luck_jingle::transport::{MAX_WRITE_CHUNK, SPP_UUID};
@@ -36,6 +36,13 @@ fn u8_field(value: &Value, field: &str) -> u8 {
         .as_u64()
         .and_then(|number| u8::try_from(number).ok())
         .unwrap_or_else(|| panic!("{field} must fit in a byte"))
+}
+
+fn u16_field(value: &Value, field: &str) -> u16 {
+    value[field]
+        .as_u64()
+        .and_then(|number| u16::try_from(number).ok())
+        .unwrap_or_else(|| panic!("{field} must fit in a u16"))
 }
 
 fn u32_field(value: &Value, field: &str) -> u32 {
@@ -99,6 +106,10 @@ fn fixture_commands_match_protocol_bytes() {
         hex_field(&commands["status"], "request_hex")
     );
     assert_eq!(
+        set_auto_shutdown(u16_field(&commands["set_auto_shutdown"], "default_minutes")).as_slice(),
+        hex_field(&commands["set_auto_shutdown"], "default_request_hex")
+    );
+    assert_eq!(
         feed_dots(u8_field(&commands["feed_dots"], "default_dots")).as_slice(),
         hex_field(&commands["feed_dots"], "default_request_hex")
     );
@@ -136,13 +147,21 @@ fn fixture_transport_and_timeouts_match_runtime_defaults() {
         Some(config.response_timeout.as_millis() as u64)
     );
     assert_eq!(
+        commands["set_auto_shutdown"]["timeout_ms"].as_u64(),
+        Some(config.response_timeout.as_millis() as u64)
+    );
+    assert_eq!(
+        u16_field(&fixture["profile"], "default_auto_shutdown_minutes"),
+        config.auto_shutdown_minutes
+    );
+    assert_eq!(
         commands["stop_job"]["timeout_ms"].as_u64(),
         Some(config.stop_timeout.as_millis() as u64)
     );
 }
 
 #[test]
-fn fixture_density_vectors_match_supported_levels_and_ack_rules() {
+fn fixture_density_vectors_match_supported_levels() {
     let fixture = fixture();
     let profile = &fixture["profile"];
     let command = &fixture["commands"]["set_density"];
@@ -173,9 +192,63 @@ fn fixture_density_vectors_match_supported_levels_and_ack_rules() {
     }
 
     assert!(Density::try_from(max.checked_add(1).expect("density max must not be 255")).is_err());
+}
 
+#[test]
+fn fixture_auto_shutdown_vectors_match_big_endian_encoding_and_default() {
+    let fixture = fixture();
+    let profile = &fixture["profile"];
+    let command = &fixture["commands"]["set_auto_shutdown"];
+    let parameter = &command["parameter"];
+
+    assert_eq!(parameter["encoding"].as_str(), Some("u16-big-endian"));
+    assert_eq!(u16_field(parameter, "min"), 0);
+    assert_eq!(u16_field(parameter, "max"), u16::MAX);
+    assert_eq!(parameter["zero_semantics"].as_str(), Some("manual-close"));
+    assert_eq!(
+        u16_field(profile, "default_auto_shutdown_minutes"),
+        DEFAULT_AUTO_SHUTDOWN_MINUTES
+    );
+    assert_eq!(
+        u16_field(command, "default_minutes"),
+        DEFAULT_AUTO_SHUTDOWN_MINUTES
+    );
+
+    let prefix = hex_field(command, "request_prefix_hex");
+    let examples = command["examples"]
+        .as_array()
+        .expect("auto-shutdown examples must be an array");
+    assert!(examples.len() >= 3);
+
+    let mut saw_manual_close = false;
+    let mut saw_nonzero_high_byte = false;
+    for example in examples {
+        let minutes = u16_field(example, "minutes");
+        let request = set_auto_shutdown(minutes);
+
+        assert_eq!(
+            request.as_slice(),
+            hex_field(example, "request_hex"),
+            "{minutes}"
+        );
+        assert_eq!(&request[..prefix.len()], prefix.as_slice(), "{minutes}");
+        saw_manual_close |= minutes == DEFAULT_AUTO_SHUTDOWN_MINUTES;
+        saw_nonzero_high_byte |= request[3] != 0;
+    }
+
+    assert!(saw_manual_close, "fixture must include manual close");
+    assert!(
+        saw_nonzero_high_byte,
+        "fixture must exercise the high minutes byte"
+    );
+}
+
+#[test]
+fn fixture_exact_ok_vectors_cover_configuration_ack_rules() {
+    let fixture = fixture();
     let mut saw_accepted = false;
     let mut saw_rejected = false;
+
     for vector in fixture["response_vectors"]
         .as_array()
         .expect("response_vectors must be an array")
@@ -197,8 +270,14 @@ fn fixture_density_vectors_match_supported_levels_and_ack_rules() {
         saw_rejected |= !accepted;
     }
 
-    assert!(saw_accepted, "fixture must include an accepted density ack");
-    assert!(saw_rejected, "fixture must include a rejected density ack");
+    assert!(
+        saw_accepted,
+        "fixture must include an accepted configuration ack"
+    );
+    assert!(
+        saw_rejected,
+        "fixture must include a rejected configuration ack"
+    );
 }
 
 #[test]
