@@ -26,7 +26,6 @@ macOS 构建会把包含 `NSBluetoothAlwaysUsageDescription` 的用途说明嵌�
 | `LUCK_JINGLE_DENSITY` | 否 | `1` | 打印浓度：`0`、`1` 或 `2`；启动时读取，不写入图片算法 |
 | `LUCK_JINGLE_FEED_DOTS` | 否 | `80` | 每个普通卷纸作业结束后的走纸点数 |
 | `LUCK_JINGLE_BIND_ADDRESS` | 否 | `0.0.0.0:5444` | HTTP 监听地址 |
-| `LUCK_JINGLE_GITHUB_TOKEN` | 否 | 无 | 访问需要认证的 GitHub 附件；只发送到 GitHub 附件入口，跨域跳转时会移除 |
 | `RUST_LOG` | 否 | `info` | Rust 日志过滤器；日志不会输出打印正文 |
 
 ```sh
@@ -68,7 +67,7 @@ LUCK_JINGLE_DENSITY="2" cargo run --release --bin print_image -- res/fox.png
 - `POST /print`：接收并打印原始 Markdown 文本。
 - `POST /github-webhooks`：接收 GitHub `issues`、`issue_comment` 和 `ping` 事件。
 
-服务默认监听 `0.0.0.0:5444`，且不提供入站认证。只应在可信网络中开放；也可以将 `LUCK_JINGLE_BIND_ADDRESS` 改为 `127.0.0.1:5444`，或将服务置于带认证的反向代理之后。`LUCK_JINGLE_GITHUB_TOKEN` 只用于下载受保护的 GitHub 图片，不是 HTTP 接口的认证凭据。
+服务默认监听 `0.0.0.0:5444`，且不提供入站认证。只应在可信网络中开放；也可以将 `LUCK_JINGLE_BIND_ADDRESS` 改为 `127.0.0.1:5444`，或将服务置于带认证的反向代理之后。
 
 ### Markdown 打印
 
@@ -101,7 +100,7 @@ curl --fail-with-body \
 
 ### GitHub Webhook
 
-Issue 和评论正文中的公网 HTTPS Markdown 图片会被下载、缩放到 384 点宽，并与通知文字合成为一个打印作业。普通 Markdown 链接保留标签文字，不打印 URL。每个正文最多处理 4 张图片，每张下载数据最多 10 MiB；超额、下载失败或无法解码的图片会改为纸面占位提示，通知正文仍会打印。`LUCK_JINGLE_GITHUB_TOKEN` 只会发送到初始 GitHub attachment 入口，不会携带到重定向地址或普通图片域名。
+Issue 和评论正文中的公网 HTTPS Markdown 图片会被下载、缩放到 384 点宽，并与通知文字合成为一个打印作业。普通 Markdown 链接保留标签文字，不打印 URL。每个正文最多处理 4 张图片，每张下载数据最多 10 MiB；超额、下载失败或无法解码的图片会改为纸面占位提示，通知正文仍会打印。
 
 Webhook 成功进入内存队列后返回 `202 Accepted`。打印由单一 worker 串行执行；只有收到 D1X 的停止确认后才记录成功。发生 partial write、超时或断线时会关闭 dirty session，且不会自动重放光栅数据，以免重复出纸。
 

@@ -921,7 +921,7 @@ impl MacRfcommBackend {
             });
         match result {
             Ok(connected) => {
-                self.connected.store(connected, Ordering::Release);
+                self.connected.store(connected, Ordering::Relaxed);
                 connected
             }
             Err(error) => {
@@ -929,7 +929,7 @@ impl MacRfcommBackend {
                     "failed to query macOS RFCOMM helper connection state for {}: {error:#}",
                     self.address
                 );
-                self.connected.store(false, Ordering::Release);
+                self.connected.store(false, Ordering::Relaxed);
                 false
             }
         }
@@ -940,7 +940,7 @@ impl MacRfcommBackend {
             if let Err(error) =
                 self.request(HelperRequest::Write(chunk.to_vec()), WRITE_REPLY_TIMEOUT)
             {
-                self.connected.store(false, Ordering::Release);
+                self.connected.store(false, Ordering::Relaxed);
                 return Err(error)
                     .with_context(|| format!("failed to write to RFCOMM device {}", self.address));
             }
@@ -959,14 +959,42 @@ impl MacRfcommBackend {
     }
 
     pub(crate) fn disconnect(&mut self) -> Result<()> {
-        let result = self
-            .request(HelperRequest::Disconnect, DISCONNECT_REPLY_TIMEOUT)
-            .with_context(|| format!("failed to disconnect RFCOMM device {}", self.address));
-        self.connected.store(false, Ordering::Release);
-        result.map(|_| ())
+        self.connected.store(false, Ordering::Relaxed);
+        let mut helper = self
+            .helper
+            .lock()
+            .map_err(|_| anyhow!("macOS RFCOMM helper lock was poisoned"))?;
+
+        if !helper.is_usable() {
+            return Ok(());
+        }
+
+        let result = helper.request(HelperRequest::Disconnect, DISCONNECT_REPLY_TIMEOUT);
+        if let Err(error) = result {
+            let helper_pipe_closed = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+            });
+            if helper_pipe_closed {
+                log::debug!(
+                    "macOS RFCOMM helper pipe closed while disconnecting {}; treating the device as disconnected: {error:#}",
+                    self.address
+                );
+                return Ok(());
+            }
+            return Err(error)
+                .with_context(|| format!("failed to disconnect RFCOMM device {}", self.address));
+        }
+
+        Ok(())
     }
 
     fn request(&self, request: HelperRequest, timeout: Duration) -> Result<Vec<u8>> {
+        if !self.connected.load(Ordering::Relaxed) {
+            bail!("RFCOMM device already disconnected");
+        }
+
         self.helper
             .lock()
             .map_err(|_| anyhow!("macOS RFCOMM helper lock was poisoned"))?
@@ -1061,6 +1089,7 @@ impl HelperProcess {
     fn spawn() -> Result<Self> {
         let executable = env::current_exe().context("failed to locate the current executable")?;
         let mut child = Command::new(&executable)
+            // run helper
             .env(HELPER_MODE_ENV, HELPER_MODE_VALUE)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1218,7 +1247,7 @@ impl Drop for HelperProcess {
         let shutdown_succeeded = self
             .request(HelperRequest::Shutdown, DROP_REPLY_TIMEOUT)
             .is_ok();
-        self.input.take();
+        drop(self.input.take());
         if !shutdown_succeeded || !self.wait_for_exit(HELPER_EXIT_GRACE) {
             self.terminate();
         }
@@ -2022,6 +2051,123 @@ mod tests {
 
             assert_eq!(backend.channel, channel);
         }
+    }
+
+    #[test]
+    fn disconnect_succeeds_when_the_helper_is_already_unavailable() {
+        let (_response_tx, responses) = mpsc::sync_channel(1);
+        let mut backend = MacRfcommBackend {
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
+            channel: None,
+            helper: Mutex::new(HelperProcess {
+                child: None,
+                input: None,
+                responses,
+                response_reader: None,
+            }),
+            connected: AtomicBool::new(true),
+        };
+
+        backend.disconnect().unwrap();
+
+        assert!(!backend.connected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disconnect_succeeds_when_the_helper_pipe_breaks_after_the_usability_check() {
+        let mut closed_input_child = Command::new("/usr/bin/true")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let closed_input = closed_input_child.stdin.take().unwrap();
+        closed_input_child.wait().unwrap();
+
+        let mut live_child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let live_output = live_child.stdout.take().unwrap();
+        let (response_tx, responses) = mpsc::sync_channel(1);
+        let response_reader =
+            thread::spawn(move || helper_response_reader(live_output, response_tx));
+        let mut backend = MacRfcommBackend {
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
+            channel: None,
+            helper: Mutex::new(HelperProcess {
+                child: Some(live_child),
+                input: Some(BufWriter::new(closed_input)),
+                responses,
+                response_reader: Some(response_reader),
+            }),
+            connected: AtomicBool::new(true),
+        };
+        assert!(backend.helper.get_mut().unwrap().is_usable());
+
+        backend.disconnect().unwrap();
+
+        assert!(!backend.connected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disconnect_propagates_a_response_error_from_a_usable_helper() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (response_tx, responses) = mpsc::sync_channel(1);
+        let response_reader = thread::spawn(move || helper_response_reader(output, response_tx));
+        let mut backend = MacRfcommBackend {
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
+            channel: None,
+            helper: Mutex::new(HelperProcess {
+                child: Some(child),
+                input: Some(BufWriter::new(input)),
+                responses,
+                response_reader: Some(response_reader),
+            }),
+            connected: AtomicBool::new(true),
+        };
+
+        let error = backend.disconnect().unwrap_err();
+
+        assert!(format!("{error:#}").contains("response is too short"));
+        assert!(!backend.connected.load(Ordering::Acquire));
+        assert!(backend.helper.get_mut().unwrap().is_usable());
+    }
+
+    #[test]
+    fn disconnect_propagates_helper_eof_after_writing_the_request() {
+        let mut child = Command::new("/bin/dd")
+            .args(["of=/dev/null", "bs=5", "count=1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (response_tx, responses) = mpsc::sync_channel(1);
+        let response_reader = thread::spawn(move || helper_response_reader(output, response_tx));
+        let mut backend = MacRfcommBackend {
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
+            channel: None,
+            helper: Mutex::new(HelperProcess {
+                child: Some(child),
+                input: Some(BufWriter::new(input)),
+                responses,
+                response_reader: Some(response_reader),
+            }),
+            connected: AtomicBool::new(true),
+        };
+
+        let error = backend.disconnect().unwrap_err();
+
+        assert!(format!("{error:#}").contains("closed stdout before replying"));
+        assert!(!backend.connected.load(Ordering::Acquire));
     }
 
     #[test]

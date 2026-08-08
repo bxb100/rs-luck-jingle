@@ -190,20 +190,11 @@ async fn run() -> io::Result<()> {
         .await
         .map_err(io::Error::other)?;
     let session_config = config.session;
-    let welcome_printer_address = printer_address.clone();
     let session = tokio::task::spawn_blocking(move || {
         let mut session = PrinterSession::new(transport, session_config);
         session
             .initialize()
             .context("failed to initialize selected printer")?;
-        let welcome_receipt = render_startup_welcome_receipt(&welcome_printer_address)?;
-        let outcome = session
-            .print(&welcome_receipt)
-            .context("failed to print startup welcome receipt")?;
-        log::info!(
-            "startup welcome receipt printed: raster_bytes={}",
-            outcome.raster_bytes
-        );
         Ok::<_, anyhow::Error>(session)
     })
     .await
@@ -243,15 +234,6 @@ fn bind_http_listener(bind_address: &str) -> io::Result<TcpListener> {
     let listener = TcpListener::bind(bind_address)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
-}
-
-fn startup_welcome_content(printer_address: &str) -> String {
-    format!("Printer Connected\nAddress: {printer_address}")
-}
-
-fn render_startup_welcome_receipt(printer_address: &str) -> Result<image::RgbImage> {
-    render_text(&startup_welcome_content(printer_address))
-        .context("failed to render startup welcome receipt")
 }
 
 async fn resolve_printer_address(
@@ -1047,21 +1029,6 @@ mod tests {
             })
             .unwrap();
         assert!(first_status_query < enable_printing);
-    }
-
-    #[test]
-    fn startup_welcome_receipt_has_expected_content_and_width() {
-        let printer_address = "02:00:00:00:00:01";
-
-        let content = startup_welcome_content(printer_address);
-        let rendered = render_startup_welcome_receipt(printer_address).unwrap();
-
-        assert_eq!(
-            content,
-            "Luck Jingle\nPrinter Connected\nAddress: 02:00:00:00:00:01\nAuto power-off: Manual"
-        );
-        assert_eq!(rendered.width(), rs_luck_jingle::protocol::PRINT_WIDTH_DOTS);
-        assert!(rendered.height() > 0);
     }
 
     #[test]
