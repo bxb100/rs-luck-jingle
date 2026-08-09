@@ -33,38 +33,35 @@ impl MarkdownImageFetcher {
 
     pub fn fetch(&self, value: &str) -> Result<Vec<u8>> {
         let url = parse_image_url(value)?;
+        let request = self
+            .client
+            .get(url)
+            .header(ACCEPT, "image/*")
+            .header(ACCEPT_ENCODING, "identity");
 
-        loop {
-            let request = self
-                .client
-                .get(url.clone())
-                .header(ACCEPT, "image/*")
-                .header(ACCEPT_ENCODING, "identity");
+        let mut response = request
+            .send()
+            .map_err(|error| anyhow::Error::new(error.without_url()))
+            .context("Markdown image request failed")?;
 
-            let mut response = request
-                .send()
-                .map_err(|error| anyhow::Error::new(error.without_url()))
-                .context("Markdown image request failed")?;
-
-            if !response.status().is_success() {
-                bail!(
-                    "Markdown image server returned HTTP {}",
-                    response.status().as_u16()
-                );
-            }
-
-            validate_image_content_type(response.headers().get(CONTENT_TYPE))?;
-
-            if response
-                .content_length()
-                .is_some_and(|length| length > MAX_IMAGE_BYTES as u64)
-            {
-                bail!("Markdown image exceeds the download size limit");
-            }
-
-            return read_limited(&mut response, MAX_IMAGE_BYTES)
-                .context("failed to read Markdown image response");
+        if !response.status().is_success() {
+            bail!(
+                "Markdown image server returned HTTP {}",
+                response.status().as_u16()
+            );
         }
+
+        validate_image_content_type(response.headers().get(CONTENT_TYPE))?;
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_IMAGE_BYTES as u64)
+        {
+            bail!("Markdown image exceeds the download size limit");
+        }
+
+        read_limited(&mut response, MAX_IMAGE_BYTES)
+            .context("failed to read Markdown image response")
     }
 }
 

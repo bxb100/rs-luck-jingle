@@ -20,7 +20,7 @@ pub struct PrinterCandidate {
 #[cfg(target_os = "linux")]
 pub async fn discover_printers(scan_timeout: Duration) -> Result<Vec<PrinterCandidate>> {
     use bluer::{AdapterEvent, DiscoveryFilter, DiscoveryTransport};
-    use futures::{StreamExt, pin_mut};
+    use futures_util::{StreamExt, pin_mut};
 
     let session = bluer::Session::new()
         .await

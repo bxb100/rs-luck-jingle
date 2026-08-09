@@ -1,4 +1,5 @@
 [env]
+_.file = ".env"
 LUCK_JINGLE_DENSITY = 2
 
 [tasks.print]

@@ -1,7 +1,12 @@
-use actix_web::http::header::{self, HeaderMap};
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use axum::{Json, Router};
+use jiff::Timestamp;
 use rs_luck_jingle::discovery::{
     PrinterCandidate, discover_printers, select_printer, write_printer_candidates,
 };
@@ -13,12 +18,13 @@ use rs_luck_jingle::transport::{RfcommTransport, Transport};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::future::IntoFuture;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::TcpListener;
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const QUEUE_CAPACITY: usize = 100;
@@ -26,6 +32,7 @@ const DEDUPE_CACHE_CAPACITY: usize = 1_024;
 const MAX_MARKDOWN_BODY_BYTES: usize = 64 * 1024;
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const REQUEST_ID_HEADER: &str = "X-Request-ID";
 
@@ -44,8 +51,17 @@ struct PrintContent {
 }
 
 struct AppState {
-    queue: SyncSender<PrintJob>,
+    queue: Mutex<Option<SyncSender<PrintJob>>>,
     dedupe: Mutex<DedupeCache>,
+}
+
+impl AppState {
+    fn close_queue(&self) {
+        self.queue
+            .lock()
+            .expect("print queue mutex poisoned")
+            .take();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -175,17 +191,19 @@ fn main() -> io::Result<()> {
         return result.map_err(io::Error::other);
     }
 
-    actix_web::rt::System::new().block_on(run())
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
 }
 
 async fn run() -> io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     let config = RuntimeConfig::from_env().map_err(io::Error::other)?;
     let listener = bind_http_listener(&config.bind_address)?;
-    let printer_address =
-        resolve_printer_address(config.printer_address.clone(), config.discovery_timeout)
-            .await
-            .map_err(io::Error::other)?;
+    let printer_address = resolve_printer_address(config.printer_address, config.discovery_timeout)
+        .await
+        .map_err(io::Error::other)?;
     let transport = build_transport(&printer_address, config.rfcomm_channel)
         .await
         .map_err(io::Error::other)?;
@@ -205,22 +223,44 @@ async fn run() -> io::Result<()> {
         run_print_worker(receiver, session, HEALTH_CHECK_INTERVAL)
     });
 
-    let state = web::Data::new(AppState {
-        queue,
+    let state = Arc::new(AppState {
+        queue: Mutex::new(Some(queue)),
         dedupe: Mutex::new(DedupeCache::new(DEDUPE_CACHE_CAPACITY)),
     });
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+    let axum_addr = listener.local_addr()?;
 
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-            .app_data(state.clone())
-            .service(index)
-            .service(print_markdown)
-            .service(github_webhooks)
-    })
-    .listen(listener)?
-    .run();
-    let server_result = server.await;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut server = Box::pin(
+        axum::serve(listener, build_router(state.clone()))
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .into_future(),
+    );
+    log::info!(
+        "HTTP server listening on {} and printing to {}",
+        axum_addr,
+        printer_address
+    );
+
+    let server_result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown_signal() => {
+            let _ = shutdown_tx.send(());
+            match tokio::time::timeout(HTTP_SHUTDOWN_TIMEOUT, &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    log::warn!(
+                        "HTTP graceful shutdown timed out after {HTTP_SHUTDOWN_TIMEOUT:?}"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    };
+    state.close_queue();
+    drop(server);
     if let Err(error) = print_worker.await {
         if server_result.is_ok() {
             return Err(io::Error::other(error));
@@ -228,6 +268,53 @@ async fn run() -> io::Result<()> {
         log::error!("print worker failed while HTTP server was stopping: {error}");
     }
     server_result
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", any(not_found).get(index).head(not_found))
+        .route(
+            "/print",
+            any(not_found)
+                .post(print_markdown)
+                .layer(DefaultBodyLimit::max(MAX_MARKDOWN_BODY_BYTES)),
+        )
+        .route("/github-webhooks", any(not_found).post(github_webhooks))
+        .with_state(state)
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            log::error!("failed to listen for Ctrl-C: {error}");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                log::error!("failed to listen for SIGTERM: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn bind_http_listener(bind_address: &str) -> io::Result<TcpListener> {
@@ -445,39 +532,44 @@ fn render_print_job(job: &PrintJob) -> Result<image::RgbImage> {
     stack_vertical(&sections).context("failed to compose printable content")
 }
 
-#[get("/")]
-async fn index() -> impl Responder {
-    HttpResponse::Ok().body("Ok")
+async fn index() -> Response {
+    body_response(StatusCode::OK, "Ok")
 }
 
-#[post("/print")]
 async fn print_markdown(
-    state: web::Data<AppState>,
-    request: HttpRequest,
-    body: web::Bytes,
-) -> HttpResponse {
-    if !has_markdown_content_type(request.headers()) {
-        return HttpResponse::UnsupportedMediaType()
-            .body("Content-Type must be text/markdown or text/markdown; charset=utf-8");
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_markdown_content_type(&headers) {
+        return body_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be text/markdown or text/markdown; charset=utf-8",
+        );
     }
 
-    let idempotency_key = match parse_idempotency_key(request.headers()) {
+    let idempotency_key = match parse_idempotency_key(&headers) {
         Ok(key) => key,
-        Err(message) => return HttpResponse::BadRequest().body(message),
+        Err(message) => return body_response(StatusCode::BAD_REQUEST, message),
     };
     let markdown = match std::str::from_utf8(&body) {
         Ok(markdown) => markdown,
-        Err(_) => return HttpResponse::BadRequest().body("Markdown body must be valid UTF-8"),
+        Err(_) => {
+            return body_response(StatusCode::BAD_REQUEST, "Markdown body must be valid UTF-8");
+        }
     };
     let content = match parse_markdown(markdown) {
         Ok(content) => content,
         Err(error) => {
             log::warn!("invalid Markdown print request: {error:#}");
-            return HttpResponse::BadRequest().body("Markdown body is invalid");
+            return body_response(StatusCode::BAD_REQUEST, "Markdown body is invalid");
         }
     };
     if content.text.is_empty() && content.image_urls.is_empty() {
-        return HttpResponse::BadRequest().body("Markdown body has no printable content");
+        return body_response(
+            StatusCode::BAD_REQUEST,
+            "Markdown body has no printable content",
+        );
     }
 
     let job_id = next_job_id();
@@ -487,7 +579,7 @@ async fn print_markdown(
         text: content.text,
         image_urls: content.image_urls,
     };
-    match enqueue_print_job(state.get_ref(), key, job) {
+    match enqueue_print_job(&state, key, job) {
         Ok(accepted_job_id) => accepted_response(&accepted_job_id),
         Err(error) => {
             log::error!("failed to enqueue Markdown print job: {error}");
@@ -496,23 +588,33 @@ async fn print_markdown(
     }
 }
 
-#[post("/github-webhooks")]
 async fn github_webhooks(
-    state: web::Data<AppState>,
-    hook: web::Json<GithubWebhook>,
-    request: HttpRequest,
-) -> impl Responder {
-    let event = match header_value(request.headers(), "X-GitHub-Event") {
-        Some(event) => event,
-        None => return HttpResponse::BadRequest().body("missing X-GitHub-Event"),
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    hook: Result<Json<GithubWebhook>, JsonRejection>,
+) -> Response {
+    let Json(hook) = match hook {
+        Ok(hook) => hook,
+        Err(error) => {
+            let status = if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return body_response(status, error.body_text());
+        }
     };
-    let delivery_id = header_value(request.headers(), "X-GitHub-Delivery")
+    let event = match header_value(&headers, "X-GitHub-Event") {
+        Some(event) => event,
+        None => return body_response(StatusCode::BAD_REQUEST, "missing X-GitHub-Event"),
+    };
+    let delivery_id = header_value(&headers, "X-GitHub-Delivery")
         .unwrap_or("missing-delivery-id")
         .to_owned();
     let content = match build_message(event, &hook) {
         Ok(Some(content)) => content,
-        Ok(None) => return HttpResponse::NoContent().finish(),
-        Err(error) => return HttpResponse::BadRequest().body(error.to_string()),
+        Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+        Err(error) => return body_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
 
     let job_id = next_job_id();
@@ -522,7 +624,7 @@ async fn github_webhooks(
         image_urls: content.image_urls,
     };
     let key = DedupeKey::GithubDelivery(delivery_id);
-    match enqueue_print_job(state.get_ref(), Some(key), job) {
+    match enqueue_print_job(&state, Some(key), job) {
         Ok(accepted_job_id) => accepted_response(&accepted_job_id),
         Err(error) => {
             log::error!("failed to enqueue GitHub print job: {error}");
@@ -537,8 +639,12 @@ fn enqueue_print_job(
     job: PrintJob,
 ) -> Result<String, mpsc::TrySendError<PrintJob>> {
     let job_id = job.job_id.clone();
+    let queue = state.queue.lock().expect("print queue mutex poisoned");
+    let Some(queue) = queue.as_ref() else {
+        return Err(mpsc::TrySendError::Disconnected(job));
+    };
     let Some(dedupe_key) = dedupe_key else {
-        state.queue.try_send(job)?;
+        queue.try_send(job)?;
         return Ok(job_id);
     };
 
@@ -547,21 +653,29 @@ fn enqueue_print_job(
         return Ok(existing_job_id.to_owned());
     }
 
-    state.queue.try_send(job)?;
+    queue.try_send(job)?;
     cache.insert(dedupe_key, job_id.clone());
     Ok(job_id)
 }
 
-fn accepted_response(job_id: &str) -> HttpResponse {
-    HttpResponse::Accepted()
-        .insert_header((REQUEST_ID_HEADER, job_id))
-        .finish()
+fn accepted_response(job_id: &str) -> Response {
+    (StatusCode::ACCEPTED, [(REQUEST_ID_HEADER, job_id)], ()).into_response()
 }
 
-fn unavailable_response() -> HttpResponse {
-    HttpResponse::ServiceUnavailable()
-        .insert_header((header::RETRY_AFTER, "1"))
-        .finish()
+fn unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        (),
+    )
+        .into_response()
+}
+
+fn body_response(status: StatusCode, body: impl Into<Body>) -> Response {
+    Response::builder()
+        .status(status)
+        .body(body.into())
+        .expect("static HTTP response must be valid")
 }
 
 fn next_job_id() -> String {
@@ -569,12 +683,12 @@ fn next_job_id() -> String {
     format!(
         "job-{}-{}-{sequence}",
         std::process::id(),
-        Utc::now().timestamp_micros()
+        Timestamp::now().as_microsecond()
     )
 }
 
 fn has_markdown_content_type(headers: &HeaderMap) -> bool {
-    let mut values = headers.get_all(header::CONTENT_TYPE);
+    let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
         return false;
     };
@@ -616,7 +730,7 @@ fn has_markdown_content_type(headers: &HeaderMap) -> bool {
 }
 
 fn parse_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
-    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER);
+    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
@@ -641,7 +755,7 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn build_message(event: &str, hook: &GithubWebhook) -> Result<Option<PrintContent>> {
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S");
+    let now = Timestamp::now().strftime("%Y-%m-%d %H:%M:%S");
     match event {
         "issues" if hook.action.as_deref() != Some("opened") => Ok(None),
         "issues" => {
@@ -754,9 +868,11 @@ struct Issue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{Method, Request, request};
     use std::collections::VecDeque as TestVecDeque;
     use std::sync::mpsc::{Receiver as EventReceiver, Sender as EventSender};
     use std::thread;
+    use tower::ServiceExt;
 
     #[derive(Debug, Eq, PartialEq)]
     enum TransportEventKind {
@@ -895,15 +1011,23 @@ mod tests {
         }
     }
 
-    fn test_state(capacity: usize) -> (web::Data<AppState>, Receiver<PrintJob>) {
+    fn test_state(capacity: usize) -> (Arc<AppState>, Receiver<PrintJob>) {
         let (queue, receiver) = mpsc::sync_channel(capacity);
         (
-            web::Data::new(AppState {
-                queue,
+            Arc::new(AppState {
+                queue: Mutex::new(Some(queue)),
                 dedupe: Mutex::new(DedupeCache::new(DEDUPE_CACHE_CAPACITY)),
             }),
             receiver,
         )
+    }
+
+    fn post_request(path: &str) -> request::Builder {
+        Request::builder().method(Method::POST).uri(path)
+    }
+
+    async fn send(app: &Router, request: Request<Body>) -> Response {
+        app.clone().oneshot(request).await.unwrap()
     }
 
     fn issue_hook(action: &str) -> GithubWebhook {
@@ -1041,28 +1165,21 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_enqueues_text_and_images() {
         let (state, receiver) = test_state(4);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
+        let app = build_router(state);
         let image_url = "https://github.com/user-attachments/assets/test-image";
-        let request = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown; charset=UTF-8"))
-            .set_payload(format!(
+        let request = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown; charset=UTF-8")
+            .body(Body::from(format!(
                 "# Receipt\nBody [link](https://example.com)\n![scan]({image_url})"
-            ))
-            .to_request();
+            )))
+            .unwrap();
 
-        let response = actix_web::test::call_service(&app, request).await;
+        let response = send(&app, request).await;
 
-        assert_eq!(response.status(), actix_web::http::StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let request_id = response
             .headers()
             .get(REQUEST_ID_HEADER)
@@ -1077,176 +1194,131 @@ mod tests {
         assert_eq!(job.image_urls, [image_url]);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_accepts_image_only_content() {
         let (state, receiver) = test_state(1);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
+        let app = build_router(state);
         let image_url = "https://github.com/user-attachments/assets/image-only";
-        let request = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown"))
-            .set_payload(format!("![scan]({image_url})"))
-            .to_request();
+        let request = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .body(Body::from(format!("![scan]({image_url})")))
+            .unwrap();
 
-        let response = actix_web::test::call_service(&app, request).await;
+        let response = send(&app, request).await;
 
-        assert_eq!(response.status(), actix_web::http::StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let job = receiver.try_recv().unwrap();
         assert!(job.text.is_empty());
         assert_eq!(job.image_urls, [image_url]);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_rejects_missing_or_wrong_content_type() {
         let (state, receiver) = test_state(4);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
+        let app = build_router(state);
         let requests = [
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .set_payload("body")
-                .to_request(),
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/plain"))
-                .set_payload("body")
-                .to_request(),
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/markdown; charset=iso-8859-1"))
-                .set_payload("body")
-                .to_request(),
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/markdown; profile=receipt"))
-                .set_payload("body")
-                .to_request(),
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/markdown"))
-                .append_header((header::CONTENT_TYPE, "text/markdown"))
-                .set_payload("body")
-                .to_request(),
+            post_request("/print").body(Body::from("body")).unwrap(),
+            post_request("/print")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("body"))
+                .unwrap(),
+            post_request("/print")
+                .header(header::CONTENT_TYPE, "text/markdown; charset=iso-8859-1")
+                .body(Body::from("body"))
+                .unwrap(),
+            post_request("/print")
+                .header(header::CONTENT_TYPE, "text/markdown; profile=receipt")
+                .body(Body::from("body"))
+                .unwrap(),
+            post_request("/print")
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .body(Body::from("body"))
+                .unwrap(),
         ];
 
         for request in requests {
-            let response = actix_web::test::call_service(&app, request).await;
-            assert_eq!(
-                response.status(),
-                actix_web::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
-            );
+            let response = send(&app, request).await;
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
         assert!(receiver.try_recv().is_err());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_rejects_invalid_utf8_and_empty_content() {
         let (state, receiver) = test_state(2);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
-        let invalid_utf8 = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown; charset=utf-8"))
-            .set_payload(web::Bytes::from_static(&[0xff]))
-            .to_request();
-        let empty = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown"))
-            .set_payload("  \n\t")
-            .to_request();
+        let app = build_router(state);
+        let invalid_utf8 = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown; charset=utf-8")
+            .body(Body::from(vec![0xff]))
+            .unwrap();
+        let empty = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .body(Body::from("  \n\t"))
+            .unwrap();
 
-        let invalid_utf8_response = actix_web::test::call_service(&app, invalid_utf8).await;
-        let empty_response = actix_web::test::call_service(&app, empty).await;
+        let invalid_utf8_response = send(&app, invalid_utf8).await;
+        let empty_response = send(&app, empty).await;
 
-        assert_eq!(
-            invalid_utf8_response.status(),
-            actix_web::http::StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            empty_response.status(),
-            actix_web::http::StatusCode::BAD_REQUEST
-        );
+        assert_eq!(invalid_utf8_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(empty_response.status(), StatusCode::BAD_REQUEST);
         assert!(receiver.try_recv().is_err());
     }
 
-    #[actix_web::test]
-    async fn print_markdown_rejects_oversized_bodies() {
+    #[tokio::test]
+    async fn print_markdown_enforces_the_exact_body_limit() {
         let (state, receiver) = test_state(1);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
-        let request = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown"))
-            .set_payload(vec![b'a'; MAX_MARKDOWN_BODY_BYTES + 1])
-            .to_request();
+        let app = build_router(state);
+        let at_limit = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .body(Body::from(vec![b'a'; MAX_MARKDOWN_BODY_BYTES]))
+            .unwrap();
+        let over_limit = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .body(Body::from(vec![b'a'; MAX_MARKDOWN_BODY_BYTES + 1]))
+            .unwrap();
 
-        let response = actix_web::test::call_service(&app, request).await;
+        let accepted = send(&app, at_limit).await;
+        let rejected = send(&app, over_limit).await;
 
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(
-            response.status(),
-            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
+            receiver.try_recv().unwrap().text.len(),
+            MAX_MARKDOWN_BODY_BYTES
         );
         assert!(receiver.try_recv().is_err());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_rejects_invalid_idempotency_keys() {
         let (state, receiver) = test_state(2);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
+        let app = build_router(state);
         let invalid_keys = ["bad key".to_owned(), "x".repeat(129)];
 
         for key in invalid_keys {
-            let request = actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/markdown"))
-                .insert_header((IDEMPOTENCY_KEY_HEADER, key))
-                .set_payload("body")
-                .to_request();
-            let response = actix_web::test::call_service(&app, request).await;
-            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+            let request = post_request("/print")
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .header(IDEMPOTENCY_KEY_HEADER, key)
+                .body(Body::from("body"))
+                .unwrap();
+            let response = send(&app, request).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
 
-        let duplicate_key = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown"))
-            .insert_header((IDEMPOTENCY_KEY_HEADER, "first"))
-            .append_header((IDEMPOTENCY_KEY_HEADER, "second"))
-            .set_payload("body")
-            .to_request();
-        let response = actix_web::test::call_service(&app, duplicate_key).await;
-        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let duplicate_key = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .header(IDEMPOTENCY_KEY_HEADER, "first")
+            .header(IDEMPOTENCY_KEY_HEADER, "second")
+            .body(Body::from("body"))
+            .unwrap();
+        let response = send(&app, duplicate_key).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         assert!(receiver.try_recv().is_err());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_returns_retry_after_and_does_not_cache_queue_failures() {
         let (queue, receiver) = mpsc::sync_channel(1);
         queue
@@ -1256,32 +1328,22 @@ mod tests {
                 image_urls: Vec::new(),
             })
             .unwrap();
-        let state = web::Data::new(AppState {
-            queue,
+        let state = Arc::new(AppState {
+            queue: Mutex::new(Some(queue)),
             dedupe: Mutex::new(DedupeCache::new(DEDUPE_CACHE_CAPACITY)),
         });
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state.clone())
-                .service(print_markdown),
-        )
-        .await;
+        let app = build_router(state.clone());
         let make_request = || {
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/markdown"))
-                .insert_header((IDEMPOTENCY_KEY_HEADER, "retry-key"))
-                .set_payload("retry me")
-                .to_request()
+            post_request("/print")
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .header(IDEMPOTENCY_KEY_HEADER, "retry-key")
+                .body(Body::from("retry me"))
+                .unwrap()
         };
 
-        let failed = actix_web::test::call_service(&app, make_request()).await;
+        let failed = send(&app, make_request()).await;
 
-        assert_eq!(
-            failed.status(),
-            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(failed.headers().get(header::RETRY_AFTER).unwrap(), "1");
         assert!(
             state
@@ -1293,61 +1355,70 @@ mod tests {
         );
 
         assert_eq!(receiver.try_recv().unwrap().job_id, "occupied");
-        let retried = actix_web::test::call_service(&app, make_request()).await;
-        assert_eq!(retried.status(), actix_web::http::StatusCode::ACCEPTED);
+        let retried = send(&app, make_request()).await;
+        assert_eq!(retried.status(), StatusCode::ACCEPTED);
         assert_eq!(receiver.try_recv().unwrap().text, "retry me");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_returns_retry_after_when_queue_is_closed() {
         let (state, receiver) = test_state(1);
         drop(receiver);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
-        let request = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown"))
-            .set_payload("body")
-            .to_request();
+        let app = build_router(state);
+        let request = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .body(Body::from("body"))
+            .unwrap();
 
-        let response = actix_web::test::call_service(&app, request).await;
+        let response = send(&app, request).await;
 
-        assert_eq!(
-            response.status(),
-            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
+    async fn closing_queue_disconnects_worker_while_router_holds_state() {
+        let (state, receiver) = test_state(1);
+        let app = build_router(state.clone());
+        state.dedupe.lock().unwrap().insert(
+            DedupeKey::PrintIdempotency("closed-key".to_owned()),
+            "existing-job".to_owned(),
+        );
+        state.close_queue();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+
+        let request = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .header(IDEMPOTENCY_KEY_HEADER, "closed-key")
+            .body(Body::from("body"))
+            .unwrap();
+        let response = send(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[tokio::test]
     async fn print_markdown_deduplicates_valid_idempotency_keys() {
         let (state, receiver) = test_state(2);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
+        let app = build_router(state);
         let make_request = || {
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/markdown"))
-                .insert_header((IDEMPOTENCY_KEY_HEADER, "stable-key"))
-                .set_payload("body")
-                .to_request()
+            post_request("/print")
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .header(IDEMPOTENCY_KEY_HEADER, "stable-key")
+                .body(Body::from("body"))
+                .unwrap()
         };
 
-        let first = actix_web::test::call_service(&app, make_request()).await;
-        let second = actix_web::test::call_service(&app, make_request()).await;
+        let first = send(&app, make_request()).await;
+        let second = send(&app, make_request()).await;
 
-        assert_eq!(first.status(), actix_web::http::StatusCode::ACCEPTED);
-        assert_eq!(second.status(), actix_web::http::StatusCode::ACCEPTED);
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
         assert_eq!(
             first.headers().get(REQUEST_ID_HEADER),
             second.headers().get(REQUEST_ID_HEADER)
@@ -1360,29 +1431,22 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_markdown_without_idempotency_key_always_enqueues() {
         let (state, receiver) = test_state(2);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown),
-        )
-        .await;
+        let app = build_router(state);
         let make_request = || {
-            actix_web::test::TestRequest::post()
-                .uri("/print")
-                .insert_header((header::CONTENT_TYPE, "text/markdown"))
-                .set_payload("body")
-                .to_request()
+            post_request("/print")
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .body(Body::from("body"))
+                .unwrap()
         };
 
-        let first = actix_web::test::call_service(&app, make_request()).await;
-        let second = actix_web::test::call_service(&app, make_request()).await;
+        let first = send(&app, make_request()).await;
+        let second = send(&app, make_request()).await;
 
-        assert_eq!(first.status(), actix_web::http::StatusCode::ACCEPTED);
-        assert_eq!(second.status(), actix_web::http::StatusCode::ACCEPTED);
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
         assert_ne!(
             first.headers().get(REQUEST_ID_HEADER),
             second.headers().get(REQUEST_ID_HEADER)
@@ -1393,44 +1457,33 @@ mod tests {
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn print_and_github_idempotency_namespaces_do_not_collide() {
         let (state, receiver) = test_state(2);
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::PayloadConfig::new(MAX_MARKDOWN_BODY_BYTES))
-                .app_data(state)
-                .service(print_markdown)
-                .service(github_webhooks),
-        )
-        .await;
-        let print_request = actix_web::test::TestRequest::post()
-            .uri("/print")
-            .insert_header((header::CONTENT_TYPE, "text/markdown"))
-            .insert_header((IDEMPOTENCY_KEY_HEADER, "shared-key"))
-            .set_payload("body")
-            .to_request();
-        let github_request = actix_web::test::TestRequest::post()
-            .uri("/github-webhooks")
-            .insert_header(("X-GitHub-Event", "ping"))
-            .insert_header(("X-GitHub-Delivery", "shared-key"))
-            .set_json(serde_json::json!({
-                "zen": "Keep it logically awesome.",
-                "repository": { "full_name": "owner/repository" }
-            }))
-            .to_request();
+        let app = build_router(state);
+        let print_request = post_request("/print")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .header(IDEMPOTENCY_KEY_HEADER, "shared-key")
+            .body(Body::from("body"))
+            .unwrap();
+        let github_request = post_request("/github-webhooks")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-GitHub-Event", "ping")
+            .header("X-GitHub-Delivery", "shared-key")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "zen": "Keep it logically awesome.",
+                    "repository": { "full_name": "owner/repository" }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
 
-        let print_response = actix_web::test::call_service(&app, print_request).await;
-        let github_response = actix_web::test::call_service(&app, github_request).await;
+        let print_response = send(&app, print_request).await;
+        let github_response = send(&app, github_request).await;
 
-        assert_eq!(
-            print_response.status(),
-            actix_web::http::StatusCode::ACCEPTED
-        );
-        assert_eq!(
-            github_response.status(),
-            actix_web::http::StatusCode::ACCEPTED
-        );
+        assert_eq!(print_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(github_response.status(), StatusCode::ACCEPTED);
         assert_ne!(
             print_response.headers().get(REQUEST_ID_HEADER),
             github_response.headers().get(REQUEST_ID_HEADER)
@@ -1438,6 +1491,94 @@ mod tests {
         assert_ne!(
             receiver.try_recv().unwrap().job_id,
             receiver.try_recv().unwrap().job_id
+        );
+    }
+
+    #[tokio::test]
+    async fn github_webhook_preserves_json_rejection_status_codes() {
+        let (state, receiver) = test_state(1);
+        let app = build_router(state);
+        let missing_content_type = post_request("/github-webhooks")
+            .header("X-GitHub-Event", "ping")
+            .body(Body::from(
+                r#"{"repository":{"full_name":"owner/repository"}}"#,
+            ))
+            .unwrap();
+        let invalid_data = post_request("/github-webhooks")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-GitHub-Event", "ping")
+            .body(Body::from("{}"))
+            .unwrap();
+        let oversized = post_request("/github-webhooks")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-GitHub-Event", "ping")
+            .body(Body::from(vec![b' '; 2 * 1024 * 1024 + 1]))
+            .unwrap();
+
+        assert_eq!(
+            send(&app, missing_content_type).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(&app, invalid_data).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(&app, oversized).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn router_preserves_method_and_path_behavior() {
+        let (state, _receiver) = test_state(1);
+        let app = build_router(state);
+        let index = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let head = Request::builder()
+            .method(Method::HEAD)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let wrong_method = Request::builder()
+            .method(Method::GET)
+            .uri("/print")
+            .body(Body::empty())
+            .unwrap();
+        let wrong_webhook_method = Request::builder()
+            .method(Method::GET)
+            .uri("/github-webhooks")
+            .body(Body::empty())
+            .unwrap();
+        let trailing_slash = post_request("/print/")
+            .header(header::CONTENT_TYPE, "text/markdown")
+            .body(Body::from("body"))
+            .unwrap();
+
+        let index = send(&app, index).await;
+        let index_status = index.status();
+        let index_body = axum::body::to_bytes(index.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(index_status, StatusCode::OK);
+        assert_eq!(index_body, "Ok");
+        let head = send(&app, head).await;
+        assert_eq!(head.status(), StatusCode::NOT_FOUND);
+        assert!(head.headers().get(header::ALLOW).is_none());
+        let wrong_method = send(&app, wrong_method).await;
+        assert_eq!(wrong_method.status(), StatusCode::NOT_FOUND);
+        assert!(wrong_method.headers().get(header::ALLOW).is_none());
+        let wrong_webhook_method = send(&app, wrong_webhook_method).await;
+        assert_eq!(wrong_webhook_method.status(), StatusCode::NOT_FOUND);
+        assert!(wrong_webhook_method.headers().get(header::ALLOW).is_none());
+        assert_eq!(
+            send(&app, trailing_slash).await.status(),
+            StatusCode::NOT_FOUND
         );
     }
 

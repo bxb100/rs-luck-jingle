@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 use std::io::{self, Write};
 
 #[cfg(target_os = "macos")]
@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 pub const SPP_UUID: &str = "00001101-0000-1000-8000-00805F9B34FB";
 pub const MAX_WRITE_CHUNK: usize = 16_384;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 fn write_in_chunks<W>(writer: &mut W, data: &[u8]) -> io::Result<()>
 where
     W: Write,
@@ -263,7 +263,7 @@ mod linux {
     use anyhow::{Context, Result, bail};
     use bluer::rfcomm::{Profile, ProfileHandle, ReqError, Role};
     use bluer::{Address, Device, ErrorKind as BluerErrorKind, Session, Uuid};
-    use futures::{FutureExt, StreamExt};
+    use futures_util::{FutureExt, StreamExt};
     use tokio::runtime::{Handle, RuntimeFlavor};
 
     use super::{RfcommTransport, SPP_UUID};
@@ -571,7 +571,7 @@ mod linux {
         };
 
         let handshake = tokio::time::timeout(PROFILE_CONNECT_TIMEOUT, async {
-            futures::try_join!(connect, accept)
+            futures_util::try_join!(connect, accept)
         })
         .await;
 

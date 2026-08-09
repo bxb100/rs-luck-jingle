@@ -2,7 +2,6 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{Context, anyhow};
 use image::{DynamicImage, ImageReader, Limits, Rgb, RgbImage, RgbaImage};
 use imageproc::drawing::draw_text_mut;
-use rust_embed::RustEmbed;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -18,6 +17,7 @@ const MAX_SOURCE_DIMENSION: u32 = 16_384;
 const MAX_SOURCE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
 const ERROR_DIFFUSION_DIVISOR: i32 = 32;
+const FONT_DATA: &[u8] = include_bytes!("../res/zpix.ttf");
 const ERROR_DIFFUSION_KERNEL: [(i32, i32, i32); 10] = [
     (1, 0, 5),
     (2, 0, 3),
@@ -31,15 +31,8 @@ const ERROR_DIFFUSION_KERNEL: [(i32, i32, i32); 10] = [
     (1, 2, 2),
 ];
 
-#[derive(RustEmbed)]
-#[folder = "res"]
-#[include = "*.ttf"]
-struct FontAssets;
-
 pub fn render_text(text: &str) -> anyhow::Result<RgbImage> {
-    let font_data = FontAssets::get("zpix.ttf").context("Embedded font is missing")?;
-    let font =
-        FontRef::try_from_slice(font_data.data.as_ref()).context("Embedded font is invalid")?;
+    let font = FontRef::try_from_slice(FONT_DATA).context("Embedded font is invalid")?;
     let scale = PxScale::from(FONT_SIZE);
     let available_width = (CANVAS_WIDTH - HORIZONTAL_PADDING * 2) as f32;
     let lines = wrap_text(&font, scale, text, available_width);
