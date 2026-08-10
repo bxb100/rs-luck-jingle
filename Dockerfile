@@ -1,36 +1,25 @@
-FROM rust:1.74.1-bullseye AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
 WORKDIR /app
-RUN cargo install cargo-chef
 
 FROM chef AS planner
-# Copy the whole project
 COPY . .
-# Prepare a build plan ("recipe")
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
-
-# Copy the build plan from the previous Docker stage
 COPY --from=planner /app/recipe.json recipe.json
-# Build dependencies - this layer is cached as long as `recipe.json`
-# doesn't change.
-RUN cargo chef cook --recipe-path recipe.json
+# Build dependencies - this is the caching Docker layer!
+RUN cargo chef cook --release --recipe-path recipe.json
+# Build application
 COPY . .
-# Build the project
 RUN cargo build --release --bin rs-luck-jingle
 
-# Runtime stage
-FROM debian:bullseye-slim AS runtime
+# We do not need the Rust toolchain to run the binary!
+FROM debian:trixie-slim AS runtime
 WORKDIR /app
-
 RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-    bluez \
-    rfkill \
-    # Clean up
-    && apt-get autoremove -y \
+    && apt-get install -y --no-install-recommends bluez ca-certificates \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/rs-luck-jingle rs-luck-jingle
-ENTRYPOINT ["./rs-luck-jingle"]
+COPY --from=builder /app/target/release/rs-luck-jingle /usr/local/bin
+ENTRYPOINT ["/usr/local/bin/rs-luck-jingle"]
