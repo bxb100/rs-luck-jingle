@@ -810,7 +810,13 @@ fn build_message(event: &str, hook: &GithubWebhook) -> Result<Option<PrintConten
             ),
             image_urls: Vec::new(),
         })),
-        unsupported => Err(anyhow!("unsupported GitHub event: {unsupported}")),
+        _ => Ok(Some(PrintContent {
+            text: format!(
+                "{now}\nREPO: {}\nEvent: {}\n",
+                hook.repository.full_name, event
+            ),
+            image_urls: Vec::new(),
+        })),
     }
 }
 
