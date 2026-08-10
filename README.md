@@ -1,4 +1,7 @@
-# 叮当小印 D1X 打印服务
+# 叮当同学 D1 热敏打印机
+
+> [!warning]
+> Current 99% of the code is written by OpenAI ChatGPT
 
 本项目将 GitHub Webhook 渲染为 384 点宽位图，并通过 Bluetooth Classic RFCOMM/SPP 发送到 `LuckP_D1X_` 打印机。
 
