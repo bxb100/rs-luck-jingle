@@ -810,13 +810,19 @@ fn build_message(event: &str, hook: &GithubWebhook) -> Result<Option<PrintConten
             ),
             image_urls: Vec::new(),
         })),
-        _ => Ok(Some(PrintContent {
-            text: format!(
-                "{now}\nREPO: {}\nEvent: {}\n",
-                hook.repository.full_name, event
-            ),
-            image_urls: Vec::new(),
-        })),
+        _ => {
+            let event = hook
+                .action
+                .as_ref()
+                .map_or(event.to_owned(), |action| format!("{event} ({action})"));
+            Ok(Some(PrintContent {
+                text: format!(
+                    "{now}\nREPO: {}\nEvent: {}\n",
+                    hook.repository.full_name, event
+                ),
+                image_urls: Vec::new(),
+            }))
+        }
     }
 }
 
