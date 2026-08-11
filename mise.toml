@@ -5,3 +5,7 @@ LUCK_JINGLE_DENSITY = 2
 [tasks.print]
 description = "Print demo image"
 run = "cargo run --bin print_image -- res/fox.png"
+
+[tasks.install]
+description = "Cargo install"
+run = "cargo install --path . --bin rs-luck-jingle"
