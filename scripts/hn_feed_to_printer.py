@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import os
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree as ET
@@ -30,6 +30,80 @@ class FeedItem:
     identifier: str
 
 
+class HTMLTextExtractor(HTMLParser):
+    BREAK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+    IGNORED_TAGS = {"script", "style"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fragments: list[str] = []
+        self.ignored_depth = 0
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        tag = tag.lower()
+        if tag in self.IGNORED_TAGS:
+            self.ignored_depth += 1
+        elif self.ignored_depth == 0 and tag in self.BREAK_TAGS:
+            self.fragments.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self.IGNORED_TAGS:
+            if self.ignored_depth > 0:
+                self.ignored_depth -= 1
+        elif self.ignored_depth == 0 and tag in self.BREAK_TAGS:
+            self.fragments.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self.ignored_depth == 0:
+            self.fragments.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self.fragments)
+
+
 def local_name(tag: str) -> str:
     """Return XML tag local name to ignore namespace prefixes."""
     return tag.rsplit("}", 1)[-1]
@@ -38,8 +112,11 @@ def local_name(tag: str) -> str:
 def clean_text(value: str | None) -> str:
     if value is None:
         return ""
-    text = html.unescape(value)
-    text = re.sub(r"<[^>]+>", "", text)
+
+    parser = HTMLTextExtractor()
+    parser.feed(value)
+    parser.close()
+    text = parser.get_text()
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
