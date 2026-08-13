@@ -57,11 +57,18 @@ struct AppState {
 
 impl AppState {
     fn close_queue(&self) {
-        self.queue
-            .lock()
-            .expect("print queue mutex poisoned")
-            .take();
+        lock_mutex(&self.queue).take();
     }
+}
+
+/// Locks a mutex, recovering the guarded value even if a prior panic left
+/// the mutex poisoned. A poisoned lock here would otherwise cascade into a
+/// panic on every future request, so we deliberately keep serving requests
+/// with whatever state survived instead of taking the whole process down.
+fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -639,7 +646,7 @@ fn enqueue_print_job(
     job: PrintJob,
 ) -> Result<String, mpsc::TrySendError<PrintJob>> {
     let job_id = job.job_id.clone();
-    let queue = state.queue.lock().expect("print queue mutex poisoned");
+    let queue = lock_mutex(&state.queue);
     let Some(queue) = queue.as_ref() else {
         return Err(mpsc::TrySendError::Disconnected(job));
     };
@@ -648,7 +655,7 @@ fn enqueue_print_job(
         return Ok(job_id);
     };
 
-    let mut cache = state.dedupe.lock().expect("dedupe cache mutex poisoned");
+    let mut cache = lock_mutex(&state.dedupe);
     if let Some(existing_job_id) = cache.get(&dedupe_key) {
         return Ok(existing_job_id.to_owned());
     }
@@ -675,7 +682,10 @@ fn body_response(status: StatusCode, body: impl Into<Body>) -> Response {
     Response::builder()
         .status(status)
         .body(body.into())
-        .expect("static HTTP response must be valid")
+        .unwrap_or_else(|error| {
+            log::error!("failed to build HTTP response: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, ()).into_response()
+        })
 }
 
 fn next_job_id() -> String {
@@ -745,7 +755,7 @@ fn parse_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, &'static
 
     Ok(Some(
         std::str::from_utf8(bytes)
-            .expect("visible ASCII must be valid UTF-8")
+            .map_err(|_| "Idempotency-Key must contain 1 to 128 visible ASCII characters")?
             .to_owned(),
     ))
 }
@@ -1077,7 +1087,14 @@ mod tests {
             *event == TransportEventKind::Read(vec![0xAA])
         });
         let health_query = wait_for_event(&events, |event| {
-            *event == TransportEventKind::Write(rs_luck_jingle::protocol::query_status().to_vec())
+            *event
+                == TransportEventKind::Write(
+                    rs_luck_jingle::protocol::compile(
+                        rs_luck_jingle::protocol::Command::QueryStatus,
+                    )
+                    .unwrap()
+                    .bytes,
+                )
         });
         wait_for_event(&events, |event| *event == TransportEventKind::Read(vec![0]));
 
@@ -1136,7 +1153,10 @@ mod tests {
         worker.join().unwrap();
 
         let event_kinds: Vec<_> = events.try_iter().map(|event| event.kind).collect();
-        let status_query = rs_luck_jingle::protocol::query_status().to_vec();
+        let status_query =
+            rs_luck_jingle::protocol::compile(rs_luck_jingle::protocol::Command::QueryStatus)
+                .unwrap()
+                .bytes;
         assert_eq!(
             event_kinds
                 .iter()
@@ -1160,7 +1180,11 @@ mod tests {
             .position(|event| {
                 *event
                     == TransportEventKind::Write(
-                        rs_luck_jingle::protocol::enable_printer().to_vec(),
+                        rs_luck_jingle::protocol::compile(
+                            rs_luck_jingle::protocol::Command::EnablePrinter,
+                        )
+                        .unwrap()
+                        .bytes,
                     )
             })
             .unwrap();

@@ -363,7 +363,8 @@ fn pack_android_rgb565(color: [u16; 3]) -> Rgb<u8> {
 
 fn wrap_text(font: &FontRef<'_>, scale: PxScale, text: &str, max_width: f32) -> Vec<String> {
     let scaled_font = font.as_scaled(scale);
-    let mut lines = vec![String::new()];
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
     let mut line_width = 0.0;
     let mut previous_glyph = None;
 
@@ -372,7 +373,7 @@ fn wrap_text(font: &FontRef<'_>, scale: PxScale, text: &str, max_width: f32) -> 
             continue;
         }
         if character == '\n' {
-            lines.push(String::new());
+            lines.push(std::mem::take(&mut current_line));
             line_width = 0.0;
             previous_glyph = None;
             continue;
@@ -384,13 +385,8 @@ fn wrap_text(font: &FontRef<'_>, scale: PxScale, text: &str, max_width: f32) -> 
             .map(|previous| scaled_font.kern(previous, glyph_id))
             .unwrap_or(0.0);
 
-        if !lines
-            .last()
-            .expect("Line collection is never empty")
-            .is_empty()
-            && line_width + kerning + advance_width > max_width
-        {
-            lines.push(String::new());
+        if !current_line.is_empty() && line_width + kerning + advance_width > max_width {
+            lines.push(std::mem::take(&mut current_line));
             line_width = 0.0;
             previous_glyph = None;
         }
@@ -398,14 +394,12 @@ fn wrap_text(font: &FontRef<'_>, scale: PxScale, text: &str, max_width: f32) -> 
         let active_kerning = previous_glyph
             .map(|previous| scaled_font.kern(previous, glyph_id))
             .unwrap_or(0.0);
-        lines
-            .last_mut()
-            .expect("Line collection is never empty")
-            .push(character);
+        current_line.push(character);
         line_width += active_kerning + advance_width;
         previous_glyph = Some(glyph_id);
     }
 
+    lines.push(current_line);
     lines
 }
 

@@ -89,12 +89,9 @@ pub fn parse_markdown(value: &str) -> Result<ParsedMarkdown> {
     let mut has_omitted_images = false;
 
     for event in parser {
-        if active_image.is_some() {
+        if let Some(mut image) = active_image.take() {
             match event {
                 Event::End(TagEnd::Image) => {
-                    let image = active_image
-                        .take()
-                        .expect("Active image should exist until its closing event");
                     if image.omitted {
                         has_omitted_images = true;
                         push_omitted_image(&mut text, &image.alt);
@@ -103,17 +100,17 @@ pub fn parse_markdown(value: &str) -> Result<ParsedMarkdown> {
                 Event::Text(value)
                 | Event::Code(value)
                 | Event::InlineMath(value)
-                | Event::DisplayMath(value) => active_image
-                    .as_mut()
-                    .expect("Active image should exist while collecting alt text")
-                    .alt
-                    .push_str(&value),
-                Event::SoftBreak | Event::HardBreak => active_image
-                    .as_mut()
-                    .expect("Active image should exist while collecting alt text")
-                    .alt
-                    .push(' '),
-                _ => {}
+                | Event::DisplayMath(value) => {
+                    image.alt.push_str(&value);
+                    active_image = Some(image);
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    image.alt.push(' ');
+                    active_image = Some(image);
+                }
+                _ => {
+                    active_image = Some(image);
+                }
             }
             continue;
         }

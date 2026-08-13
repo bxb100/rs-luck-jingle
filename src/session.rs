@@ -1,7 +1,7 @@
 use crate::protocol::{
-    DEFAULT_AUTO_SHUTDOWN_MINUTES, DEFAULT_FEED_DOTS, Density, PrinterStatus, enable_printer,
-    encode_raster, feed_dots, is_ok_response, is_stop_ack, parse_status, query_status,
-    set_auto_shutdown, set_density, stop_print_job, wake_printer,
+    Command, DEFAULT_AUTO_SHUTDOWN_MINUTES, DEFAULT_FEED_DOTS, Density, PrinterStatus,
+    ResponseContract, compile, decode_device_text, is_ok_response, is_stop_ack,
+    parse_auto_shutdown_minutes, parse_battery_percent, parse_density, parse_status,
 };
 use crate::transport::Transport;
 use anyhow::{Context, Result, anyhow};
@@ -152,17 +152,18 @@ where
             )));
         }
 
-        let raster = encode_raster(image)
+        let raster = compile(Command::PrintRaster(image))
             .context("failed to encode printer raster")
             .map_err(PrintFailure::RetrySafe)?;
+        let raster_bytes = raster.bytes.len();
         self.state = SessionState::Printing;
 
-        let result = self.execute_print(&raster);
+        let result = self.execute_print(raster.bytes);
         match result {
             Ok(()) => {
                 self.state = SessionState::Ready;
                 Ok(PrintOutcome {
-                    raster_bytes: raster.len(),
+                    raster_bytes,
                     status,
                 })
             }
@@ -174,6 +175,54 @@ where
         let result = self.transport.disconnect();
         self.state = SessionState::Disconnected;
         result
+    }
+
+    /// Reads the printer's currently configured print density.
+    pub fn density(&mut self) -> Result<Density> {
+        self.query(Command::GetDensity, |response| {
+            parse_density(response).context("invalid printer density response")
+        })
+    }
+
+    /// Reads the printer's configured auto-shutdown minutes. The firmware
+    /// only reports the low byte of this value (see
+    /// [`parse_auto_shutdown_minutes`](crate::protocol::parse_auto_shutdown_minutes)),
+    /// so this cannot distinguish shutdown durations of 256 minutes or more.
+    pub fn auto_shutdown_minutes(&mut self) -> Result<u8> {
+        self.query(Command::GetAutoShutdown, |response| {
+            parse_auto_shutdown_minutes(response).context("invalid printer auto-shutdown response")
+        })
+    }
+
+    /// Reads the printer's battery level as a percentage.
+    pub fn battery_percent(&mut self) -> Result<u8> {
+        self.query(Command::GetBatteryLevel, |response| {
+            parse_battery_percent(response).context("invalid printer battery response")
+        })
+    }
+
+    /// Reads the printer's model identifier (e.g. `"D1X-KD"`).
+    pub fn model(&mut self) -> Result<String> {
+        self.query(Command::GetModel, |response| Ok(decode_device_text(response)))
+    }
+
+    /// Reads the printer's serial number.
+    pub fn serial_number(&mut self) -> Result<String> {
+        self.query(Command::GetSerialNumber, |response| {
+            Ok(decode_device_text(response))
+        })
+    }
+
+    /// Reads the printer's firmware version.
+    pub fn firmware_version(&mut self) -> Result<String> {
+        self.query(Command::GetFirmwareVersion, |response| {
+            Ok(decode_device_text(response))
+        })
+    }
+
+    /// Restores the printer to its factory configuration.
+    pub fn factory_reset(&mut self) -> Result<()> {
+        self.query(Command::FactoryReset, |_| Ok(()))
     }
 
     fn ensure_ready(&mut self) -> Result<bool> {
@@ -188,22 +237,26 @@ where
         }
 
         self.state = SessionState::Initializing;
-        let density = set_density(self.config.density);
-        if let Err(error) = self.write_command(&density).and_then(|_| {
-            self.read_until(self.config.response_timeout, is_ok_response)
-                .map(|_| ())
-                .context("printer rejected density command")
-        }) {
+        if let Err(error) = self
+            .write_command_for(Command::SetDensity(self.config.density))
+            .and_then(|contract| {
+                self.await_response(contract)
+                    .map(|_| ())
+                    .context("printer rejected density command")
+            })
+        {
             self.close_dirty_session();
             return Err(error);
         }
 
-        let auto_shutdown = set_auto_shutdown(self.config.auto_shutdown_minutes);
-        if let Err(error) = self.write_command(&auto_shutdown).and_then(|_| {
-            self.read_until(self.config.response_timeout, is_ok_response)
-                .map(|_| ())
-                .context("printer rejected auto-shutdown command")
-        }) {
+        if let Err(error) = self
+            .write_command_for(Command::SetAutoShutdown(self.config.auto_shutdown_minutes))
+            .and_then(|contract| {
+                self.await_response(contract)
+                    .map(|_| ())
+                    .context("printer rejected auto-shutdown command")
+            })
+        {
             self.close_dirty_session();
             return Err(error);
         }
@@ -213,40 +266,90 @@ where
     }
 
     fn read_status(&mut self) -> Result<PrinterStatus> {
-        self.write_command(&query_status())?;
-        let response = self
-            .transport
-            .read(self.config.response_timeout)
-            .context("failed while waiting for printer status")?;
-        if response.len() != 1 {
-            return Err(anyhow!(
-                "invalid printer status response length: expected exactly 1 byte, got {}",
-                response.len()
-            ));
-        }
+        let contract = self.write_command_for(Command::QueryStatus)?;
+        let response = self.await_response(contract)?;
         parse_status(&response).context("invalid printer status response")
     }
 
-    fn execute_print(&mut self, raster: &[u8]) -> std::result::Result<(), PrintFailure> {
-        self.write_command(&enable_printer())
+    fn execute_print(&mut self, raster_bytes: Vec<u8>) -> std::result::Result<(), PrintFailure> {
+        self.write_command_for(Command::EnablePrinter)
             .context("failed to enable printer")
             .map_err(PrintFailure::RetrySafe)?;
-        self.write_command(&wake_printer())
+        self.write_command_for(Command::WakePrinter)
             .context("failed to wake printer")
             .map_err(PrintFailure::RetrySafe)?;
-        self.write_command(raster)
+        self.write_command(&raster_bytes)
             .context("failed to write printer raster")
             .map_err(PrintFailure::OutcomeUnknown)?;
-        self.write_command(&feed_dots(self.config.feed_dots))
+        self.write_command_for(Command::FeedDots(self.config.feed_dots))
             .context("failed to feed printed output")
             .map_err(PrintFailure::OutcomeUnknown)?;
-        self.write_command(&stop_print_job())
+        let stop_contract = self
+            .write_command_for(Command::StopPrintJob)
             .context("failed to stop print job")
             .map_err(PrintFailure::OutcomeUnknown)?;
-        self.read_until(self.config.stop_timeout, is_stop_ack)
+        self.await_response(stop_contract)
             .map(|_| ())
             .context("failed while waiting for print completion")
             .map_err(PrintFailure::OutcomeUnknown)
+    }
+
+    /// Compiles a [`Command`] through the protocol pipeline (`Command` -> IR
+    /// -> binary) and writes the resulting bytes, returning the
+    /// [`ResponseContract`] that describes how to read the printer's reply.
+    fn write_command_for(&mut self, command: Command<'_>) -> Result<ResponseContract> {
+        let compiled = compile(command).context("failed to compile printer command")?;
+        self.write_command(&compiled.bytes)?;
+        Ok(compiled.response)
+    }
+
+    /// Reads and validates a response according to its [`ResponseContract`].
+    /// This is the single place that knows which predicate and timeout apply
+    /// to which kind of response, replacing what used to be duplicated at
+    /// each call site.
+    fn await_response(&mut self, contract: ResponseContract) -> Result<Vec<u8>> {
+        match contract {
+            ResponseContract::None => Ok(Vec::new()),
+            ResponseContract::Ok => self.read_until(self.config.response_timeout, is_ok_response),
+            ResponseContract::StopAck => self.read_until(self.config.stop_timeout, is_stop_ack),
+            ResponseContract::StatusByte => {
+                let response = self
+                    .transport
+                    .read(self.config.response_timeout)
+                    .context("failed while waiting for printer status")?;
+                if response.len() != 1 {
+                    return Err(anyhow!(
+                        "invalid printer status response length: expected exactly 1 byte, got {}",
+                        response.len()
+                    ));
+                }
+                Ok(response)
+            }
+            ResponseContract::Raw => self
+                .transport
+                .read(self.config.response_timeout)
+                .context("failed while waiting for printer response"),
+        }
+    }
+
+    /// Connects (if needed), sends `command`, and decodes its reply with
+    /// `decode`. This is the shared entry point for the read-only
+    /// diagnostic queries below, so the connect/disconnect-on-error
+    /// behavior lives in one place instead of being repeated per query.
+    fn query<R>(
+        &mut self,
+        command: Command<'_>,
+        decode: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<R> {
+        self.ensure_ready()?;
+        let outcome = self
+            .write_command_for(command)
+            .and_then(|contract| self.await_response(contract))
+            .and_then(|response| decode(&response));
+        outcome.map_err(|error| {
+            self.close_dirty_session();
+            error
+        })
     }
 
     fn write_command(&mut self, data: &[u8]) -> Result<()> {
@@ -401,6 +504,10 @@ mod tests {
         }
     }
 
+    fn wire(command: Command<'_>) -> Vec<u8> {
+        compile(command).unwrap().bytes
+    }
+
     #[test]
     fn initializes_connection_before_accepting_print_jobs() {
         let (transport, handle) = MockTransport::new([b"OK".to_vec(), b"OK".to_vec()]);
@@ -412,8 +519,8 @@ mod tests {
         assert_eq!(
             handle.writes.lock().unwrap().as_slice(),
             [
-                set_density(Density::Normal),
-                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+                wire(Command::SetDensity(Density::Normal)),
+                wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES)),
             ]
         );
     }
@@ -436,10 +543,10 @@ mod tests {
         assert_eq!(
             handle.writes.lock().unwrap().as_slice(),
             [
-                set_density(Density::Normal),
-                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
-                set_density(Density::Normal),
-                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+                wire(Command::SetDensity(Density::Normal)),
+                wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES)),
+                wire(Command::SetDensity(Density::Normal)),
+                wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES)),
             ]
         );
         assert_eq!(*handle.disconnects.lock().unwrap(), 1);
@@ -472,10 +579,10 @@ mod tests {
         assert_eq!(
             handle.writes.lock().unwrap().as_slice(),
             [
-                set_density(Density::Normal).to_vec(),
-                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES).to_vec(),
-                query_status().to_vec(),
-                query_status().to_vec(),
+                wire(Command::SetDensity(Density::Normal)),
+                wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES)),
+                wire(Command::QueryStatus),
+                wire(Command::QueryStatus),
             ]
         );
         assert_eq!(*handle.disconnects.lock().unwrap(), 0);
@@ -553,12 +660,12 @@ mod tests {
         assert_eq!(
             handle.writes.lock().unwrap().as_slice(),
             [
-                set_density(Density::Normal).to_vec(),
-                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES).to_vec(),
-                query_status().to_vec(),
-                set_density(Density::Normal).to_vec(),
-                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES).to_vec(),
-                query_status().to_vec(),
+                wire(Command::SetDensity(Density::Normal)),
+                wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES)),
+                wire(Command::QueryStatus),
+                wire(Command::SetDensity(Density::Normal)),
+                wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES)),
+                wire(Command::QueryStatus),
             ]
         );
         assert_eq!(*handle.disconnects.lock().unwrap(), 1);
@@ -585,12 +692,18 @@ mod tests {
         session.print(&image).unwrap();
 
         let writes = handle.writes.lock().unwrap();
-        assert_eq!(writes[0], set_density(Density::Normal));
-        assert_eq!(writes[1], set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES));
-        assert_eq!(writes[2], query_status());
-        assert_eq!(writes[3], set_density(Density::Normal));
-        assert_eq!(writes[4], set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES));
-        assert_eq!(writes[5], query_status());
+        assert_eq!(writes[0], wire(Command::SetDensity(Density::Normal)));
+        assert_eq!(
+            writes[1],
+            wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES))
+        );
+        assert_eq!(writes[2], wire(Command::QueryStatus));
+        assert_eq!(writes[3], wire(Command::SetDensity(Density::Normal)));
+        assert_eq!(
+            writes[4],
+            wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES))
+        );
+        assert_eq!(writes[5], wire(Command::QueryStatus));
         assert_eq!(*handle.disconnects.lock().unwrap(), 1);
         assert_eq!(session.state(), SessionState::Ready);
     }
@@ -607,8 +720,8 @@ mod tests {
         assert_eq!(
             handle.writes.lock().unwrap().as_slice(),
             [
-                set_density(Density::Normal),
-                set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES),
+                wire(Command::SetDensity(Density::Normal)),
+                wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES)),
             ]
         );
         assert_eq!(*handle.disconnects.lock().unwrap(), 1);
@@ -634,17 +747,20 @@ mod tests {
         assert_eq!(outcome.raster_bytes, 9);
         let writes = handle.writes.lock().unwrap();
         assert_eq!(writes.len(), 8);
-        assert_eq!(writes[0], set_density(Density::Normal));
-        assert_eq!(writes[1], set_auto_shutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES));
-        assert_eq!(writes[2], query_status());
-        assert_eq!(writes[3], enable_printer());
-        assert_eq!(writes[4], wake_printer());
+        assert_eq!(writes[0], wire(Command::SetDensity(Density::Normal)));
+        assert_eq!(
+            writes[1],
+            wire(Command::SetAutoShutdown(DEFAULT_AUTO_SHUTDOWN_MINUTES))
+        );
+        assert_eq!(writes[2], wire(Command::QueryStatus));
+        assert_eq!(writes[3], wire(Command::EnablePrinter));
+        assert_eq!(writes[4], wire(Command::WakePrinter));
         assert_eq!(
             writes[5],
             [vec![0x1D, 0x76, 0x30, 0, 1, 0, 1, 0], vec![0xAA]].concat()
         );
-        assert_eq!(writes[6], feed_dots(DEFAULT_FEED_DOTS));
-        assert_eq!(writes[7], stop_print_job());
+        assert_eq!(writes[6], wire(Command::FeedDots(DEFAULT_FEED_DOTS)));
+        assert_eq!(writes[7], wire(Command::StopPrintJob));
     }
 
     #[test]

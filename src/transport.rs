@@ -236,8 +236,7 @@ fn normalize_bdaddr(address: &str) -> Result<String> {
         if index != 0 {
             normalized.push(':');
         }
-        use std::fmt::Write as _;
-        write!(normalized, "{octet:02X}").expect("writing to a String cannot fail");
+        normalized.push_str(&format!("{octet:02X}"));
     }
     Ok(normalized)
 }
@@ -750,7 +749,9 @@ mod linux {
                 format!("failed while waiting for RFCOMM device {address}{endpoint}")
             })?;
 
-            let stream = transport.stream.as_mut().expect("stream checked above");
+            let Some(stream) = transport.stream.as_mut() else {
+                bail!("RFCOMM device {address}{endpoint} is not connected");
+            };
             let mut buffer = vec![0_u8; READ_BUFFER_SIZE];
             let count = match stream.read(&mut buffer) {
                 Ok(0) => bail!("RFCOMM device {address}{endpoint} closed the connection"),

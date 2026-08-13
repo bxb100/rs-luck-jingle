@@ -1,8 +1,7 @@
 use image::{Rgb, RgbImage};
 use rs_luck_jingle::protocol::{
-    DEFAULT_AUTO_SHUTDOWN_MINUTES, Density, PRINT_WIDTH_DOTS, PrinterStatus, enable_printer,
-    encode_raster, feed_dots, is_ok_response, is_stop_ack, parse_status, query_status,
-    set_auto_shutdown, set_density, stop_print_job, wake_printer,
+    Command, DEFAULT_AUTO_SHUTDOWN_MINUTES, Density, PRINT_WIDTH_DOTS, PrinterStatus, compile,
+    is_ok_response, is_stop_ack, parse_status,
 };
 use rs_luck_jingle::session::SessionConfig;
 use rs_luck_jingle::transport::{MAX_WRITE_CHUNK, SPP_UUID};
@@ -29,6 +28,10 @@ fn hex_field(value: &Value, field: &str) -> Vec<u8> {
             .as_str()
             .unwrap_or_else(|| panic!("{field} must be a hex string")),
     )
+}
+
+fn wire(command: Command<'_>) -> Vec<u8> {
+    compile(command).unwrap().bytes
 }
 
 fn u8_field(value: &Value, field: &str) -> u8 {
@@ -94,27 +97,33 @@ fn fixture_commands_match_protocol_bytes() {
         PRINT_WIDTH_DOTS
     );
     assert_eq!(
-        enable_printer().as_slice(),
+        wire(Command::EnablePrinter),
         hex_field(&commands["enable"], "request_hex")
     );
     assert_eq!(
-        wake_printer().as_slice(),
+        wire(Command::WakePrinter),
         hex_field(&commands["wake"], "request_hex")
     );
     assert_eq!(
-        query_status().as_slice(),
+        wire(Command::QueryStatus),
         hex_field(&commands["status"], "request_hex")
     );
     assert_eq!(
-        set_auto_shutdown(u16_field(&commands["set_auto_shutdown"], "default_minutes")).as_slice(),
+        wire(Command::SetAutoShutdown(u16_field(
+            &commands["set_auto_shutdown"],
+            "default_minutes"
+        ))),
         hex_field(&commands["set_auto_shutdown"], "default_request_hex")
     );
     assert_eq!(
-        feed_dots(u8_field(&commands["feed_dots"], "default_dots")).as_slice(),
+        wire(Command::FeedDots(u8_field(
+            &commands["feed_dots"],
+            "default_dots"
+        ))),
         hex_field(&commands["feed_dots"], "default_request_hex")
     );
     assert_eq!(
-        stop_print_job().as_slice(),
+        wire(Command::StopPrintJob),
         hex_field(&commands["stop_job"], "request_hex")
     );
 }
@@ -181,7 +190,7 @@ fn fixture_density_vectors_match_supported_levels() {
         let level = u8_field(example, "level");
         let density = Density::try_from(level)
             .unwrap_or_else(|error| panic!("invalid fixture density {level}: {error}"));
-        let request = set_density(density);
+        let request = wire(Command::SetDensity(density));
 
         assert_eq!(
             request.as_slice(),
@@ -224,7 +233,7 @@ fn fixture_auto_shutdown_vectors_match_big_endian_encoding_and_default() {
     let mut saw_nonzero_high_byte = false;
     for example in examples {
         let minutes = u16_field(example, "minutes");
-        let request = set_auto_shutdown(minutes);
+        let request = wire(Command::SetAutoShutdown(minutes));
 
         assert_eq!(
             request.as_slice(),
@@ -399,7 +408,8 @@ fn fixture_raster_vectors_encode_exact_frames() {
             assert_eq!(right_padding_bits, u64::from((8 - width % 8) % 8), "{name}");
         }
 
-        let encoded = encode_raster(&raster_image(vector))
+        let encoded = compile(Command::PrintRaster(&raster_image(vector)))
+            .map(|compiled| compiled.bytes)
             .unwrap_or_else(|error| panic!("failed to encode {name}: {error}"));
         let header = hex_field(vector, "header_hex");
         let payload = hex_field(vector, "payload_hex");
